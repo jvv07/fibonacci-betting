@@ -87,11 +87,7 @@ with st.sidebar:
 # Helper — safe DB connection indicator
 # ---------------------------------------------------------------------------
 def _db_connected() -> bool:
-    try:
-        db.get_client()
-        return True
-    except Exception:
-        return False
+    return db.ping()
 
 
 # ===========================================================================
