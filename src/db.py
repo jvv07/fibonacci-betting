@@ -30,13 +30,22 @@ def _force_http1(client: Client) -> None:
     Supabase's free tier (and GitHub Actions' network) can trigger HTTP/2
     StreamReset (RST_STREAM PROTOCOL_ERROR) on every connection.  Forcing
     HTTP/1.1 on the postgrest transport eliminates those errors entirely.
+
+    Headers are rebuilt from env vars rather than copied from the old session
+    to avoid httpx rejecting bytes-typed header values.
     """
     try:
-        old = client.postgrest.session
+        key = os.environ["SUPABASE_KEY"]
+        base_url = str(client.postgrest.session.base_url)
         client.postgrest.session = httpx.Client(
-            base_url=str(old.base_url),
-            headers=dict(old.headers),
-            http2=False,        # force HTTP/1.1
+            base_url=base_url,
+            headers={
+                "apikey": key,
+                "Authorization": f"Bearer {key}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            http2=False,
             timeout=30.0,
         )
     except Exception as e:
