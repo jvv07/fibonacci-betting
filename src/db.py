@@ -10,6 +10,7 @@ SQL to create tables is in the project README / deployment checklist.
 import os
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -22,35 +23,58 @@ load_dotenv()
 _client: Client | None = None
 
 
+def _force_http1(client: Client) -> None:
+    """
+    Replace the postgrest httpx session with one that uses HTTP/1.1 only.
+
+    Supabase's free tier (and GitHub Actions' network) can trigger HTTP/2
+    StreamReset (RST_STREAM PROTOCOL_ERROR) on every connection.  Forcing
+    HTTP/1.1 on the postgrest transport eliminates those errors entirely.
+    """
+    try:
+        old = client.postgrest.session
+        client.postgrest.session = httpx.Client(
+            base_url=str(old.base_url),
+            headers=dict(old.headers),
+            http2=False,        # force HTTP/1.1
+            timeout=30.0,
+        )
+    except Exception as e:
+        print(f"[db] HTTP/1.1 patch skipped ({e}) — using default transport.")
+
+
 def get_client() -> Client:
-    """Return a cached Supabase client, initialising it on first call."""
+    """Return a cached Supabase client configured to use HTTP/1.1."""
     global _client
     if _client is None:
         url = os.environ["SUPABASE_URL"]
         key = os.environ["SUPABASE_KEY"]
         _client = create_client(url, key)
+        _force_http1(_client)
     return _client
 
 
 def _fresh_client() -> Client:
-    """Force a new client instance — used to recover from connection resets."""
+    """Force a brand-new client instance (used after unrecoverable errors)."""
     global _client
     url = os.environ["SUPABASE_URL"]
     key = os.environ["SUPABASE_KEY"]
     _client = create_client(url, key)
+    _force_http1(_client)
     return _client
 
 
 def _execute(fn):
     """
-    Run a Supabase query function, retrying once with a fresh client if the
-    HTTP/2 connection was reset (StreamReset error from long-running scripts).
+    Run a Supabase query, retrying once with a fresh client on any
+    connection-level error (belt-and-suspenders on top of the HTTP/1.1 fix).
     """
     try:
         return fn(get_client())
     except Exception as e:
-        if "StreamReset" in str(e) or "stream" in str(e).lower():
-            print(f"[db] Connection reset — retrying with fresh client. ({e})")
+        err = str(e).lower()
+        if any(k in err for k in ("streamreset", "stream", "connect", "timeout")):
+            print(f"[db] Connection error — retrying with fresh client. ({e})")
             try:
                 return fn(_fresh_client())
             except Exception as e2:
