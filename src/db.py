@@ -32,6 +32,33 @@ def get_client() -> Client:
     return _client
 
 
+def _fresh_client() -> Client:
+    """Force a new client instance — used to recover from connection resets."""
+    global _client
+    url = os.environ["SUPABASE_URL"]
+    key = os.environ["SUPABASE_KEY"]
+    _client = create_client(url, key)
+    return _client
+
+
+def _execute(fn):
+    """
+    Run a Supabase query function, retrying once with a fresh client if the
+    HTTP/2 connection was reset (StreamReset error from long-running scripts).
+    """
+    try:
+        return fn(get_client())
+    except Exception as e:
+        if "StreamReset" in str(e) or "stream" in str(e).lower():
+            print(f"[db] Connection reset — retrying with fresh client. ({e})")
+            try:
+                return fn(_fresh_client())
+            except Exception as e2:
+                print(f"[db] Retry also failed: {e2}")
+                return None
+        raise
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -173,15 +200,14 @@ def get_fixtures_today() -> list[dict]:
     try:
         today = datetime.now(timezone.utc).date().isoformat()
         tomorrow = (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
-        res = (
-            get_client()
-            .table("fixtures")
+        res = _execute(
+            lambda c: c.table("fixtures")
             .select("*")
             .gte("kickoff_utc", today)
             .lt("kickoff_utc", tomorrow)
             .execute()
         )
-        return res.data or []
+        return (res.data if res else None) or []
     except Exception as e:
         print(f"[db] get_fixtures_today error: {e}")
         return []
@@ -207,14 +233,13 @@ def upsert_fixtures(fixture_list: list[dict]) -> bool:
 def get_leagues() -> list[dict]:
     """Return all league rows ordered by seasonal draw rate descending."""
     try:
-        res = (
-            get_client()
-            .table("leagues")
+        res = _execute(
+            lambda c: c.table("leagues")
             .select("*")
             .order("draw_rate_season", desc=True)
             .execute()
         )
-        return res.data or []
+        return (res.data if res else None) or []
     except Exception as e:
         print(f"[db] get_leagues error: {e}")
         return []
@@ -245,9 +270,8 @@ def get_portfolio_stats() -> dict:
                         win_rate, draw_rate, total_bets, total_wins
     """
     try:
-        res = (
-            get_client()
-            .table("bets")
+        res = _execute(
+            lambda c: c.table("bets")
             .select("stake, gross_return, net_pnl, result")
             .execute()
         )
