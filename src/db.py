@@ -26,11 +26,15 @@ _headers: dict | None = None
 
 
 def _init() -> None:
-    """Set up the REST base URL and auth headers from env vars (once)."""
+    """Set up the REST base URL and auth headers from env vars (once).
+
+    Strips whitespace from env var values to guard against accidental trailing
+    newlines that GitHub Actions sometimes adds to secret values.
+    """
     global _base_url, _headers
     if _base_url is None:
-        supabase_url = os.environ["SUPABASE_URL"].rstrip("/")
-        key = os.environ["SUPABASE_KEY"]
+        supabase_url = os.environ["SUPABASE_URL"].strip().rstrip("/")
+        key = os.environ["SUPABASE_KEY"].strip()
         _base_url = f"{supabase_url}/rest/v1"
         _headers = {
             "apikey": key,
