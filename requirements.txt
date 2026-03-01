@@ -1,0 +1,7 @@
+streamlit
+supabase
+requests
+pandas
+plotly
+python-dotenv
+APScheduler
