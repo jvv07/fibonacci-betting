@@ -10,6 +10,7 @@ is unchanged.
 """
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -25,16 +26,34 @@ _base_url: str | None = None
 _headers: dict | None = None
 
 
-def _init() -> None:
-    """Set up the REST base URL and auth headers from env vars (once).
+def _clean(value: str) -> str:
+    """
+    Remove characters that urllib3 v2 rejects in HTTP header values.
+    Allowed range: tab (0x09) and printable ASCII (0x20–0x7e).
+    This guards against invisible characters or line-breaks that can appear
+    when copy-pasting secrets into CI systems.
+    """
+    cleaned = re.sub(r"[^\x09\x20-\x7e]", "", str(value))
+    if len(cleaned) != len(value.strip()):
+        removed = len(value.strip()) - len(cleaned)
+        print(f"[db] _clean: removed {removed} invalid character(s) from env var value.")
+    return cleaned
 
-    Strips whitespace from env var values to guard against accidental trailing
-    newlines that GitHub Actions sometimes adds to secret values.
+
+def _init() -> None:
+    """
+    Set up the REST base URL and auth headers from env vars (once).
+    Values are sanitised through _clean() to strip any hidden control
+    characters before they reach urllib3's strict header validator.
     """
     global _base_url, _headers
     if _base_url is None:
-        supabase_url = os.environ["SUPABASE_URL"].strip().rstrip("/")
-        key = os.environ["SUPABASE_KEY"].strip()
+        raw_url = os.environ["SUPABASE_URL"]
+        raw_key = os.environ["SUPABASE_KEY"]
+        supabase_url = _clean(raw_url).rstrip("/")
+        key = _clean(raw_key)
+        # Diagnostic — shows lengths without exposing the secret value
+        print(f"[db] init: url_len={len(supabase_url)} key_len={len(key)}")
         _base_url = f"{supabase_url}/rest/v1"
         _headers = {
             "apikey": key,
