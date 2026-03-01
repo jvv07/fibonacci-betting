@@ -1,13 +1,13 @@
 """
-app.py — Streamlit dashboard for fibonacci-betting.
+app.py — Fibonacci Betting dashboard v2.
 
-Six pages via sidebar navigation:
-  🎯 Today's Bets   — qualifying fixtures + log results
-  📊 Dashboard      — portfolio metrics, P&L chart, sequence ladder
-  📋 Bet History    — filterable log of all settled bets + CSV export
-  🔬 Backtester     — API-Football or CSV-driven season simulation
-  🏆 League Scanner — draw-rate rankings + manual activate/deactivate
-  ⚙️  Settings       — base stake, odds threshold, Fibonacci cap, bankroll
+Linear-inspired dark UI. Six pages via sidebar navigation:
+  Today      — qualifying fixtures, value scores, exposure warning, log results
+  Dashboard  — portfolio metrics, P&L chart, monthly heatmap, sequences, risk analytics
+  History    — filterable bet log, CSV + Excel download
+  Backtester — API-Football or CSV-driven season simulation
+  Leagues    — draw-rate rankings, activate/deactivate
+  Settings   — staking parameters, ruin probability preview
 """
 
 import io
@@ -21,243 +21,375 @@ import plotly.graph_objects as go
 import streamlit as st
 from dotenv import load_dotenv
 
-# Make project root importable when streamlit is run from any cwd
 sys.path.insert(0, str(Path(__file__).parent))
 load_dotenv()
 
 from src import data_fetcher, db, fibonacci_engine, league_scanner
 
 # ---------------------------------------------------------------------------
+# Graceful streamlit-extras import
+# ---------------------------------------------------------------------------
+try:
+    from streamlit_extras.metric_cards import style_metric_cards
+    from streamlit_extras.colored_header import colored_header
+    _HAS_EXTRAS = True
+except ImportError:
+    _HAS_EXTRAS = False
+
+# ---------------------------------------------------------------------------
 # Page config
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Fibonacci Betting",
-    page_icon="🎯",
+    page_title="Fibonacci",
+    page_icon="💵",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ---------------------------------------------------------------------------
-# Shared CSS
+# Linear-style CSS
 # ---------------------------------------------------------------------------
 st.markdown(
     """
     <style>
-    /* Tighten metric cards */
-    [data-testid="metric-container"] {
-        background: #1c1f26;
-        border: 1px solid #2d3140;
-        border-radius: 8px;
-        padding: 12px 16px;
+    /* Global */
+    [data-testid="stAppViewContainer"] { background-color: #0d0f12; }
+    [data-testid="stSidebar"] {
+        background-color: #111318;
+        border-right: 1px solid #1a1e2a;
     }
-    /* Step-progress bar colour */
+    /* Metric cards */
+    [data-testid="metric-container"] {
+        background: #16191f;
+        border: 1px solid #1a1e2a;
+        border-left: 3px solid #00c853;
+        border-radius: 7px;
+        padding: 14px 18px;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.73rem !important;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        color: #6b7280 !important;
+    }
+    [data-testid="stMetricValue"] {
+        font-size: 1.55rem !important;
+        font-weight: 700;
+        color: #e2e5eb !important;
+    }
+    [data-testid="stMetricDelta"] { font-size: 0.82rem !important; }
+    /* Progress */
     .stProgress > div > div { background-color: #00c853; }
-    /* Sidebar radio label size */
-    [data-testid="stSidebar"] .stRadio label { font-size: 0.95rem; }
+    /* Primary buttons */
+    .stButton > button[kind="primary"] {
+        background-color: #00c853;
+        color: #0d0f12;
+        border: none;
+        font-weight: 700;
+        letter-spacing: 0.04em;
+        border-radius: 6px;
+    }
+    .stButton > button[kind="primary"]:hover { background-color: #00a844; }
+    /* Sidebar nav */
+    [data-testid="stSidebar"] .stRadio label {
+        font-size: 0.86rem;
+        letter-spacing: 0.04em;
+        color: #6b7280;
+        padding: 2px 0;
+    }
+    /* Dividers */
+    hr { border-color: #1a1e2a !important; }
+    /* Dataframe */
+    [data-testid="stDataFrame"] {
+        border: 1px solid #1a1e2a;
+        border-radius: 6px;
+    }
+    /* Expander */
+    .streamlit-expanderHeader { font-size: 0.85rem; color: #6b7280 !important; }
+    /* Tabs */
+    .stTabs [data-baseweb="tab"] {
+        font-size: 0.85rem;
+        letter-spacing: 0.04em;
+        color: #6b7280;
+    }
+    .stTabs [aria-selected="true"] { color: #e2e5eb !important; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # ---------------------------------------------------------------------------
-# Sidebar navigation
+# Helpers
 # ---------------------------------------------------------------------------
-with st.sidebar:
-    st.markdown("## 🎰 Fibonacci Betting")
-    st.markdown("---")
-    page = st.radio(
-        "Navigation",
-        [
-            "🎯 Today's Bets",
-            "📊 Dashboard",
-            "📋 Bet History",
-            "🔬 Backtester",
-            "🏆 League Scanner",
-            "⚙️ Settings",
-        ],
-        label_visibility="collapsed",
-    )
-    st.markdown("---")
-    api_calls = data_fetcher.get_api_calls_today()
-    st.caption(f"API calls today: **{api_calls}/100**")
-    st.progress(min(api_calls / 100, 1.0))
 
-
-# ---------------------------------------------------------------------------
-# Helper — safe DB connection indicator
-# ---------------------------------------------------------------------------
 def _db_connected() -> bool:
     return db.ping()
 
 
+def _section(label: str, description: str = "") -> None:
+    """Colored section header (streamlit-extras or plain fallback)."""
+    if _HAS_EXTRAS:
+        try:
+            colored_header(label=label, description=description, color_name="green-70")
+            return
+        except Exception:
+            pass
+    st.markdown(f"**{label}**")
+    if description:
+        st.caption(description)
+    st.markdown("<hr style='margin:4px 0 12px 0;'>", unsafe_allow_html=True)
+
+
+def _cards() -> None:
+    """Apply streamlit-extras metric card polish (no-op if not installed)."""
+    if _HAS_EXTRAS:
+        try:
+            style_metric_cards(
+                background_color="#16191f",
+                border_left_color="#00c853",
+                border_color="#1a1e2a",
+                box_shadow=False,
+            )
+        except Exception:
+            pass
+
+
+def _ruin_prob(draw_rate: float, max_step: int) -> float:
+    """Geometric probability of max_step consecutive non-draws (stop-loss per series)."""
+    if draw_rate <= 0:
+        return 100.0
+    if draw_rate >= 1:
+        return 0.0
+    return round((1 - draw_rate) ** max_step * 100, 2)
+
+
+def _runway(bankroll: float, base_stake: float, max_step: int) -> float:
+    """Number of full worst-case series the bankroll can absorb."""
+    FIBONACCI = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55]
+    worst = sum(base_stake * FIBONACCI[i] for i in range(min(max_step, len(FIBONACCI))))
+    return round(bankroll / worst, 1) if worst > 0 else float("inf")
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+with st.sidebar:
+    st.markdown(
+        "<div style='padding:14px 0 6px 0;'>"
+        "<span style='font-size:1.3rem; font-weight:800; letter-spacing:-0.03em; color:#e2e5eb;'>"
+        "💵 FIBONACCI</span><br>"
+        "<span style='font-size:0.68rem; color:#374151; letter-spacing:0.12em; text-transform:uppercase;'>"
+        "Betting System</span></div>",
+        unsafe_allow_html=True,
+    )
+    st.markdown("<hr style='margin:6px 0 10px;'>", unsafe_allow_html=True)
+
+    page = st.radio(
+        "nav",
+        ["Today", "Dashboard", "History", "Backtester", "Leagues", "Settings"],
+        label_visibility="collapsed",
+    )
+
+    st.markdown("<hr style='margin:10px 0 8px;'>", unsafe_allow_html=True)
+    _api = data_fetcher.get_api_calls_today()
+    _pct = min(_api / 100, 1.0)
+    _c = "#ef4444" if _pct > 0.9 else "#f59e0b" if _pct > 0.7 else "#00c853"
+    st.markdown(
+        f"<div style='font-size:0.73rem; color:#4b5563; margin-bottom:3px;'>"
+        f"API · <span style='color:{_c};'>{_api}/100</span></div>",
+        unsafe_allow_html=True,
+    )
+    st.progress(_pct)
+
+
 # ===========================================================================
-# PAGE 1 — Today's Bets
+# PAGE — TODAY
 # ===========================================================================
 
-def page_today_bets():
-    st.title("🎯 Today's Bets")
-
-    col_refresh, col_status = st.columns([1, 3])
-    with col_refresh:
-        if st.button("🔄 Refresh", use_container_width=True):
-            st.rerun()
+def page_today():
+    _section("Today's Bets", "Qualifying fixtures for the Fibonacci ladder")
 
     if not _db_connected():
-        st.error("Database not connected — check SUPABASE_URL and SUPABASE_KEY in your .env file.")
+        st.error("Database not connected — check SUPABASE_URL / SUPABASE_KEY.")
         return
 
-    # Load data ---------------------------------------------------------------
-    all_fixtures = db.get_fixtures_today()
+    col_r, col_s = st.columns([1, 6])
+    with col_r:
+        if st.button("Refresh", type="primary", use_container_width=True):
+            st.rerun()
+
+    fixtures = db.get_fixtures_today()
     settings = db.get_settings() or {}
-    sequences = db.get_active_sequences()
-    seq_map = {s["league_key"]: s for s in sequences}
-    leagues_data = {l["league_key"]: l for l in db.get_leagues()}
+    seq_map = {s["league_key"]: s for s in db.get_active_sequences()}
+    leagues_map = {l["league_key"]: l for l in db.get_leagues()}
 
-    # Build qualifying list ---------------------------------------------------
-    qualifying_fixtures: list[dict] = []
-    display_rows: list[dict] = []
+    qualifying: list[dict] = []
+    rows: list[dict] = []
 
-    for fix in all_fixtures:
+    for fix in fixtures:
         odds = fix.get("draw_odds")
-        league_key = fix.get("league_key", "")
-        if not odds or not fibonacci_engine.is_bet_qualified(odds, league_key):
+        lk = fix.get("league_key", "")
+        if not odds or not fibonacci_engine.is_bet_qualified(odds, lk):
             continue
 
-        step = seq_map.get(league_key, {}).get("current_step", 1)
-        stake = fibonacci_engine.get_required_stake(league_key)
+        step = seq_map.get(lk, {}).get("current_step", 1)
+        stake = fibonacci_engine.get_required_stake(lk)
         h2h = float(fix.get("h2h_draw_rate") or 0)
-        league_name = leagues_data.get(league_key, {}).get("league_name", league_key)
+        season_rate = float(leagues_map.get(lk, {}).get("draw_rate_season") or 0)
+        league_name = leagues_map.get(lk, {}).get("league_name", lk)
         kickoff = (fix.get("kickoff_utc") or "")[:16].replace("T", " ")
-        confidence = "🟢" if h2h > 0.30 else "🟡" if h2h > 0.25 else "🔴"
 
-        qualifying_fixtures.append(
-            {**fix, "_step": step, "_stake": stake, "_league_name": league_name}
-        )
-        display_rows.append(
-            {
-                "Match": f"{fix['home_team']} vs {fix['away_team']}",
-                "League": league_name,
-                "Kickoff (UTC)": kickoff,
-                "Draw Odds": odds,
-                "Fib Step": step,
-                "Stake (£)": f"£{stake:.2f}",
-                "H2H Draw%": f"{h2h*100:.1f}%" if h2h else "—",
-                "Conf": confidence,
-            }
-        )
+        # Value Score: draw_odds × season_draw_rate (>1.0 = positive EV)
+        value_score = round(float(odds) * season_rate, 3) if season_rate else None
 
-    # Summary -----------------------------------------------------------------
-    if not qualifying_fixtures:
-        st.info(
-            "No qualifying bets today. "
-            "Run the daily refresh script or wait for the 07:00 UTC automation."
-        )
-        with col_status:
-            st.caption(f"🕐 {datetime.now(timezone.utc).strftime('%H:%M UTC')} — No fixtures match the current criteria.")
+        qualifying.append({**fix, "_step": step, "_stake": stake, "_league": league_name})
+        rows.append({
+            "Match": f"{fix['home_team']} vs {fix['away_team']}",
+            "League": league_name,
+            "Kickoff (UTC)": kickoff,
+            "Odds": float(odds),
+            "Step": step,
+            "Stake (£)": stake,
+            "H2H Draw%": f"{h2h * 100:.1f}%" if h2h else "—",
+            "Value Score": value_score,
+        })
+
+    with col_s:
+        if qualifying:
+            st.success(f"{len(qualifying)} qualifying bet(s) identified today")
+        else:
+            st.info(
+                "No qualifying bets today. "
+                "Run the daily refresh or wait for the 07:00 UTC automation."
+            )
+
+    if not qualifying:
         return
 
-    with col_status:
-        st.success(f"**{len(qualifying_fixtures)}** qualifying bet(s) identified today")
+    # Simultaneous exposure warning
+    total_exposure = sum(f["_stake"] for f in qualifying)
+    bankroll = float(settings.get("bankroll") or 0)
+    if bankroll > 0 and total_exposure / bankroll > 0.20:
+        pct_str = f"{total_exposure / bankroll * 100:.1f}%"
+        st.warning(
+            f"Simultaneous exposure warning: £{total_exposure:.2f} across "
+            f"{len(qualifying)} bet(s) = {pct_str} of bankroll."
+        )
 
-    # Fixtures table ----------------------------------------------------------
-    df = pd.DataFrame(display_rows)
+    # Table
+    df = pd.DataFrame(rows)
 
     def _colour_odds(val):
         if isinstance(val, float):
             if val >= 3.0:
-                return "color: #00ff88; font-weight: bold"
+                return "color:#00c853; font-weight:700"
             if val >= 2.88:
-                return "color: #ffc107; font-weight: bold"
+                return "color:#f59e0b; font-weight:700"
         return ""
 
-    raw_odds_col = [float(r["Draw Odds"]) for r in display_rows]
-    df_display = df.copy()
-    df_display["Draw Odds"] = raw_odds_col
+    def _colour_value(val):
+        if isinstance(val, float):
+            if val >= 1.0:
+                return "color:#00c853; font-weight:700"
+            if val >= 0.85:
+                return "color:#f59e0b"
+        return "color:#6b7280"
 
-    styled = df_display.style.applymap(_colour_odds, subset=["Draw Odds"]).format(
-        {"Draw Odds": "{:.2f}"}
+    styled = (
+        df.style
+        .applymap(_colour_odds, subset=["Odds"])
+        .applymap(_colour_value, subset=["Value Score"])
+        .format({
+            "Odds": "{:.2f}",
+            "Stake (£)": "£{:.2f}",
+            "Value Score": lambda v: f"{v:.3f}" if isinstance(v, float) else "—",
+        })
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    # Total exposure today
-    total_exposure = sum(f["_stake"] for f in qualifying_fixtures)
-    st.metric("Total Stake Today", f"£{total_exposure:.2f}")
+    st.caption(
+        "Value Score = draw odds × season draw rate. "
+        "Above 1.00 indicates positive expected value."
+    )
+
+    # Summary metrics
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Stake Today", f"£{total_exposure:.2f}")
+    c2.metric("Qualifying Fixtures", len(qualifying))
+    if bankroll:
+        c3.metric("Exposure / Bankroll", f"{total_exposure / bankroll * 100:.1f}%")
+    _cards()
 
     st.markdown("---")
 
-    # Log Result expander -----------------------------------------------------
-    with st.expander("📝 Log a Result"):
-        st.markdown("Record the outcome of a bet once the match has finished.")
-
+    # Log Result
+    with st.expander("Log a Result"):
+        st.caption("Record the outcome once the match has finished.")
         labels = [
-            f"{f['home_team']} vs {f['away_team']}  |  "
-            f"Step {f['_step']}  |  £{f['_stake']:.2f}  |  "
-            f"@ {f.get('draw_odds', '?')}"
-            for f in qualifying_fixtures
+            f"{f['home_team']} vs {f['away_team']}  ·  "
+            f"Step {f['_step']}  ·  £{f['_stake']:.2f}  @  {f.get('draw_odds', '?')}"
+            for f in qualifying
         ]
-        sel_idx = st.selectbox("Select fixture", range(len(labels)), format_func=lambda i: labels[i])
-        sel_fix = qualifying_fixtures[sel_idx]
+        sel_idx = st.selectbox(
+            "Fixture", range(len(labels)), format_func=lambda i: labels[i]
+        )
+        sel = qualifying[sel_idx]
 
         c1, c2 = st.columns([1, 2])
         with c1:
             result = st.radio("Outcome", ["WIN", "LOSS"], horizontal=True)
         with c2:
             st.markdown(
-                f"**Stake:** £{sel_fix['_stake']:.2f}  &nbsp;&nbsp;  "
-                f"**Odds:** {sel_fix.get('draw_odds', '?')}  &nbsp;&nbsp;  "
-                f"**Step:** {sel_fix['_step']}"
+                f"Stake **£{sel['_stake']:.2f}** &nbsp;·&nbsp; "
+                f"Odds **{sel.get('draw_odds', '?')}** &nbsp;·&nbsp; "
+                f"Step **{sel['_step']}**"
             )
 
-        if st.button("✅ Submit Result", type="primary"):
-            # Find or create the pending bet record
+        if st.button("Submit Result", type="primary"):
             pending = db.get_pending_bets()
             existing = next(
-                (b for b in pending if b.get("fixture_id") == sel_fix.get("fixture_id")),
-                None,
+                (b for b in pending if b.get("fixture_id") == sel.get("fixture_id")), None
             )
-
             if existing:
                 bet_id = existing["id"]
             else:
-                saved = db.save_bet(
-                    {
-                        "fixture_id": sel_fix.get("fixture_id"),
-                        "league_key": sel_fix.get("league_key"),
-                        "home_team": sel_fix.get("home_team"),
-                        "away_team": sel_fix.get("away_team"),
-                        "kickoff_utc": sel_fix.get("kickoff_utc"),
-                        "fib_step": sel_fix["_step"],
-                        "stake": sel_fix["_stake"],
-                        "odds": sel_fix.get("draw_odds"),
-                        "result": "PENDING",
-                    }
-                )
+                saved = db.save_bet({
+                    "fixture_id": sel.get("fixture_id"),
+                    "league_key": sel.get("league_key"),
+                    "home_team": sel.get("home_team"),
+                    "away_team": sel.get("away_team"),
+                    "kickoff_utc": sel.get("kickoff_utc"),
+                    "fib_step": sel["_step"],
+                    "stake": sel["_stake"],
+                    "odds": sel.get("draw_odds"),
+                    "result": "PENDING",
+                })
                 bet_id = saved["id"] if saved else None
 
             if bet_id:
                 outcome = fibonacci_engine.process_result(
                     bet_id=bet_id,
-                    league_key=sel_fix.get("league_key", ""),
+                    league_key=sel.get("league_key", ""),
                     result=result,
-                    stake=float(sel_fix["_stake"]),
-                    odds=float(sel_fix.get("draw_odds") or 2.88),
+                    stake=float(sel["_stake"]),
+                    odds=float(sel.get("draw_odds") or 2.88),
                 )
                 if result == "WIN":
-                    st.success(f"✅ {outcome['message']}")
+                    st.success(outcome["message"])
                     st.balloons()
                 else:
-                    st.warning(f"📉 {outcome['message']}")
+                    st.warning(outcome["message"])
                 st.rerun()
             else:
-                st.error("Could not save bet record — check database connection.")
+                st.error("Could not save bet — check DB connection.")
 
 
 # ===========================================================================
-# PAGE 2 — Dashboard
+# PAGE — DASHBOARD
 # ===========================================================================
 
 def page_dashboard():
-    st.title("📊 Dashboard")
+    _section("Dashboard", "Portfolio performance and Fibonacci sequences")
 
     if not _db_connected():
         st.error("Database not connected.")
@@ -267,151 +399,240 @@ def page_dashboard():
     stats = summary["stats"]
     sequences = summary["sequences"]
     settings = db.get_settings() or {}
-    leagues_data = {l["league_key"]: l for l in db.get_leagues()}
+    leagues_map = {l["league_key"]: l for l in db.get_leagues()}
 
-    # Metric cards ------------------------------------------------------------
     bankroll = float(settings.get("bankroll") or 0)
+    base_stake = float(settings.get("base_stake", 10.0))
+    max_step = int(settings.get("max_fib_step", 7))
     net_pnl = stats["net_pnl"]
-    pnl_delta_colour = "normal" if net_pnl >= 0 else "inverse"
 
-    c1, c2, c3, c4 = st.columns(4)
+    # Metrics
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Bankroll", f"£{bankroll:,.2f}")
     c2.metric(
         "Net P&L",
         f"£{net_pnl:+,.2f}",
         delta=f"£{net_pnl:+.2f}",
-        delta_color=pnl_delta_colour,
+        delta_color="normal" if net_pnl >= 0 else "inverse",
     )
-    c3.metric("Win Rate", f"{stats['win_rate']:.1f}%", f"{stats['total_wins']}/{stats['total_bets']} bets")
+    c3.metric(
+        "Win Rate",
+        f"{stats['win_rate']:.1f}%",
+        f"{stats['total_wins']}/{stats['total_bets']}",
+    )
     c4.metric("ROI", f"{stats['roi']:+.2f}%")
-
-    st.markdown("---")
-
-    # P&L line chart ----------------------------------------------------------
-    history = db.get_bet_history(days=180)
-    if history:
-        history_sorted = sorted(
-            [b for b in history if b.get("result") in ("WIN", "LOSS") and b.get("net_pnl") is not None],
-            key=lambda b: b.get("created_at", ""),
-        )
-        if history_sorted:
-            pnl_cumsum = 0.0
-            chart_data = []
-            for b in history_sorted:
-                pnl_cumsum += float(b["net_pnl"])
-                chart_data.append(
-                    {
-                        "Date": b.get("created_at", "")[:10],
-                        "Cumulative P&L (£)": round(pnl_cumsum, 2),
-                        "Match": f"{b.get('home_team')} vs {b.get('away_team')}",
-                        "Result": b.get("result"),
-                    }
-                )
-            df_chart = pd.DataFrame(chart_data)
-            fig = px.line(
-                df_chart,
-                x="Date",
-                y="Cumulative P&L (£)",
-                title="Cumulative P&L Over Time",
-                hover_data=["Match", "Result"],
-                color_discrete_sequence=["#00c853"],
-            )
-            fig.update_layout(
-                plot_bgcolor="#0e1117",
-                paper_bgcolor="#0e1117",
-                font_color="#fafafa",
-                xaxis=dict(gridcolor="#2d3140"),
-                yaxis=dict(gridcolor="#2d3140", zeroline=True, zerolinecolor="#555"),
-                hovermode="x unified",
-            )
-            fig.add_hline(y=0, line_dash="dash", line_color="#555")
-            st.plotly_chart(fig, use_container_width=True)
+    if bankroll:
+        rw = _runway(bankroll, base_stake, max_step)
+        c5.metric("Runway", f"{rw:.1f} series", help="Worst-case series before bankroll depleted")
     else:
-        st.info("No settled bets yet — P&L chart will appear once results are logged.")
+        c5.metric("Runway", "—")
+    _cards()
 
+    # P&L chart
     st.markdown("---")
+    history = db.get_bet_history(days=180)
+    settled = sorted(
+        [b for b in history if b.get("result") in ("WIN", "LOSS") and b.get("net_pnl") is not None],
+        key=lambda b: b.get("created_at", ""),
+    )
 
-    # Active Fibonacci sequences table ----------------------------------------
-    st.subheader("Active Fibonacci Sequences")
+    if settled:
+        cumsum = 0.0
+        chart_pts = []
+        for b in settled:
+            cumsum += float(b["net_pnl"])
+            chart_pts.append({
+                "Date": b["created_at"][:10],
+                "P&L": round(cumsum, 2),
+                "Match": f"{b.get('home_team')} vs {b.get('away_team')}",
+                "Result": b.get("result"),
+            })
+        df_chart = pd.DataFrame(chart_pts)
+
+        fig = px.area(
+            df_chart, x="Date", y="P&L",
+            hover_data=["Match", "Result"],
+            color_discrete_sequence=["#00c853"],
+        )
+        fig.update_traces(fillcolor="rgba(0,200,83,0.07)", line_color="#00c853", line_width=2)
+        fig.update_layout(
+            plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12",
+            font_color="#9ca3af",
+            xaxis=dict(gridcolor="#1a1e2a", title=""),
+            yaxis=dict(gridcolor="#1a1e2a", zeroline=True, zerolinecolor="#2d3748", title="Cumulative P&L (£)"),
+            hovermode="x unified",
+            margin=dict(l=0, r=0, t=30, b=0),
+            title="Cumulative P&L",
+            title_font=dict(color="#e2e5eb", size=13),
+        )
+        fig.add_hline(y=0, line_dash="dot", line_color="#374151", line_width=1)
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Monthly P&L heatmap
+        st.markdown("---")
+        _section("Monthly P&L Heatmap", "Daily profit/loss calendar view")
+        try:
+            df_daily = (
+                pd.DataFrame([{
+                    "date": pd.to_datetime(b["created_at"][:10]),
+                    "pnl": float(b["net_pnl"]),
+                } for b in settled])
+                .groupby("date")["pnl"].sum()
+                .reset_index()
+            )
+            df_daily["month"] = df_daily["date"].dt.to_period("M").astype(str)
+            df_daily["day"] = df_daily["date"].dt.day
+
+            pivot = df_daily.pivot_table(
+                index="month", columns="day", values="pnl", aggfunc="sum"
+            )
+            # newest month first
+            pivot = pivot.loc[sorted(pivot.index, reverse=True)]
+
+            fig_heat = go.Figure(data=go.Heatmap(
+                z=pivot.values,
+                x=[str(d) for d in pivot.columns],
+                y=list(pivot.index),
+                colorscale=[
+                    [0.0, "#7f1d1d"],
+                    [0.45, "#1a1e2a"],
+                    [1.0, "#064e3b"],
+                ],
+                zmid=0,
+                text=[
+                    [f"£{v:+.2f}" if not pd.isna(v) else "" for v in row]
+                    for row in pivot.values
+                ],
+                texttemplate="%{text}",
+                showscale=True,
+                xgap=2,
+                ygap=2,
+                colorbar=dict(tickfont=dict(color="#6b7280"), outlinewidth=0),
+            ))
+            fig_heat.update_layout(
+                plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12",
+                font_color="#9ca3af",
+                xaxis=dict(title="Day of Month", gridcolor="#1a1e2a"),
+                yaxis=dict(title="", gridcolor="#1a1e2a"),
+                margin=dict(l=0, r=0, t=10, b=0),
+                height=max(200, len(pivot) * 52 + 60),
+            )
+            st.plotly_chart(fig_heat, use_container_width=True)
+        except Exception as e:
+            st.caption(f"Heatmap unavailable: {e}")
+
+    else:
+        st.info("No settled bets yet — charts will appear once results are logged.")
+
+    # Fibonacci sequences
+    st.markdown("---")
+    _section("Active Sequences", "Current ladder state per league")
 
     if not sequences:
-        st.info("No active sequences. Add leagues and place bets to see the ladder here.")
+        st.info("No active sequences — place bets to see the ladder here.")
         return
 
-    max_step = int(settings.get("max_fib_step", 7))
-    base_stake = float(settings.get("base_stake", 10.0))
     FIBONACCI = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55]
+    # Column header
+    h = st.columns([2.5, 1, 2.5, 1.5, 1.5, 1.5])
+    for col, lbl in zip(h, ["League", "Step", "Progress", "Next Stake", "Exposure", "Risk"]):
+        col.markdown(
+            f"<span style='font-size:0.72rem; color:#4b5563; text-transform:uppercase; "
+            f"letter-spacing:0.08em;'>{lbl}</span>",
+            unsafe_allow_html=True,
+        )
 
     for seq in sequences:
         lk = seq.get("league_key", "")
-        league_name = leagues_data.get(lk, {}).get("league_name", lk)
+        name = leagues_map.get(lk, {}).get("league_name", lk)
         step = int(seq.get("current_step", 1))
         cum_loss = float(seq.get("cumulative_loss", 0))
         idx = min(step - 1, len(FIBONACCI) - 1)
         next_stake = round(base_stake * FIBONACCI[idx], 2)
-        progress = step / max_step
 
         if step <= 3:
-            status = "✅ Safe"
-            badge_colour = "#00c853"
+            risk_txt, risk_col = "SAFE", "#00c853"
         elif step <= 5:
-            status = "⚠️ Caution"
-            badge_colour = "#ffc107"
+            risk_txt, risk_col = "CAUTION", "#f59e0b"
         else:
-            status = "🚨 High Risk"
-            badge_colour = "#ff4444"
+            risk_txt, risk_col = "HIGH RISK", "#ef4444"
 
-        with st.container():
-            col_name, col_step, col_bar, col_stake, col_exp, col_status = st.columns(
-                [2, 1, 2, 1.5, 1.5, 1.5]
-            )
-            col_name.markdown(f"**{league_name}**")
-            col_step.markdown(f"Step **{step}** / {max_step}")
-            with col_bar:
-                st.progress(min(progress, 1.0))
-            col_stake.markdown(f"Next: **£{next_stake:.2f}**")
-            col_exp.markdown(f"Exposure: £{cum_loss:.2f}")
-            col_status.markdown(
-                f"<span style='color:{badge_colour}'>{status}</span>",
-                unsafe_allow_html=True,
-            )
+        row = st.columns([2.5, 1, 2.5, 1.5, 1.5, 1.5])
+        row[0].markdown(f"**{name}**")
+        row[1].markdown(f"`{step}/{max_step}`")
+        with row[2]:
+            st.progress(min(step / max_step, 1.0))
+        row[3].markdown(f"£{next_stake:.2f}")
+        row[4].markdown(f"−£{cum_loss:.2f}")
+        row[5].markdown(
+            f"<span style='color:{risk_col}; font-size:0.78rem; font-weight:700; "
+            f"letter-spacing:0.05em;'>{risk_txt}</span>",
+            unsafe_allow_html=True,
+        )
+
+    # Risk analytics
+    st.markdown("---")
+    _section("Risk Analytics", "Series ruin probability and bankroll runway")
+
+    active_rates = [
+        float(l.get("draw_rate_season") or 0)
+        for l in leagues_map.values()
+        if l.get("is_active")
+    ]
+    avg_rate = sum(active_rates) / len(active_rates) if active_rates else 0.27
+
+    ra1, ra2, ra3 = st.columns(3)
+    ra1.metric(
+        "Avg Draw Rate (active leagues)",
+        f"{avg_rate * 100:.1f}%",
+        help="Mean season draw rate across active leagues",
+    )
+    ra2.metric(
+        "Series Ruin Probability",
+        f"{_ruin_prob(avg_rate, max_step):.2f}%",
+        help=f"Chance of {max_step} consecutive losses (stop-loss) before a draw win",
+    )
+    if bankroll:
+        ra3.metric(
+            "Bankroll Runway",
+            f"{_runway(bankroll, base_stake, max_step):.1f} series",
+            help="Max-loss series bankroll can absorb before depletion",
+        )
+    _cards()
 
 
 # ===========================================================================
-# PAGE 3 — Bet History
+# PAGE — HISTORY
 # ===========================================================================
 
-def page_bet_history():
-    st.title("📋 Bet History")
+def page_history():
+    _section("Bet History", "Complete log of all placed bets")
 
     if not _db_connected():
         st.error("Database not connected.")
         return
 
-    # Filters -----------------------------------------------------------------
     fc1, fc2, fc3 = st.columns([2, 2, 2])
     with fc1:
-        days_back = st.slider("Show last N days", min_value=7, max_value=365, value=90, step=7)
+        days_back = st.slider("Days", min_value=7, max_value=365, value=90, step=7)
     with fc2:
         all_leagues = db.get_leagues()
-        league_options = {l["league_key"]: l.get("league_name", l["league_key"]) for l in all_leagues}
-        selected_leagues = st.multiselect(
-            "Filter by league",
-            options=list(league_options.keys()),
-            format_func=lambda k: league_options[k],
-            default=[],
+        league_opts = {l["league_key"]: l.get("league_name", l["league_key"]) for l in all_leagues}
+        sel_leagues = st.multiselect(
+            "League",
+            options=list(league_opts.keys()),
+            format_func=lambda k: league_opts[k],
         )
     with fc3:
         result_filter = st.multiselect(
-            "Filter by result",
+            "Result",
             options=["WIN", "LOSS", "PENDING"],
             default=["WIN", "LOSS", "PENDING"],
         )
 
     bets = db.get_bet_history(days=days_back)
-
-    if selected_leagues:
-        bets = [b for b in bets if b.get("league_key") in selected_leagues]
+    if sel_leagues:
+        bets = [b for b in bets if b.get("league_key") in sel_leagues]
     if result_filter:
         bets = [b for b in bets if b.get("result") in result_filter]
 
@@ -419,158 +640,211 @@ def page_bet_history():
         st.info("No bets found for the selected filters.")
         return
 
-    # Build display DataFrame -------------------------------------------------
-    rows = []
-    for b in bets:
-        rows.append(
-            {
-                "Date": (b.get("created_at") or "")[:10],
-                "Match": f"{b.get('home_team', '?')} vs {b.get('away_team', '?')}",
-                "League": league_options.get(b.get("league_key", ""), b.get("league_key", "")),
-                "Step": b.get("fib_step", ""),
-                "Stake (£)": float(b.get("stake") or 0),
-                "Odds": float(b.get("odds") or 0),
-                "Result": b.get("result", "PENDING"),
-                "Gross Return (£)": float(b.get("gross_return") or 0),
-                "Net P&L (£)": float(b.get("net_pnl") or 0),
-            }
-        )
-
+    rows = [
+        {
+            "Date": (b.get("created_at") or "")[:10],
+            "Match": f"{b.get('home_team', '?')} vs {b.get('away_team', '?')}",
+            "League": league_opts.get(b.get("league_key", ""), b.get("league_key", "")),
+            "Step": b.get("fib_step", ""),
+            "Stake": float(b.get("stake") or 0),
+            "Odds": float(b.get("odds") or 0),
+            "Result": b.get("result", "PENDING"),
+            "Return": float(b.get("gross_return") or 0),
+            "P&L": float(b.get("net_pnl") or 0),
+        }
+        for b in bets
+    ]
     df = pd.DataFrame(rows)
 
-    # Colour rows by result ---------------------------------------------------
-    def _row_style(row):
-        result = row.get("Result", "")
-        if result == "WIN":
-            return ["background-color: #0a3d1a"] * len(row)
-        if result == "LOSS":
-            return ["background-color: #3d0a0a"] * len(row)
-        return [""] * len(row)
+    def _row_colour(row):
+        r = row.get("Result", "")
+        if r == "WIN":
+            return ["background-color:#052e12; color:#86efac"] * len(row)
+        if r == "LOSS":
+            return ["background-color:#2d0a0a; color:#fca5a5"] * len(row)
+        return ["color:#6b7280"] * len(row)
 
-    styled = df.style.apply(_row_style, axis=1).format(
-        {"Stake (£)": "£{:.2f}", "Gross Return (£)": "£{:.2f}", "Net P&L (£)": "£{:+.2f}", "Odds": "{:.2f}"}
+    styled = df.style.apply(_row_colour, axis=1).format(
+        {"Stake": "£{:.2f}", "Return": "£{:.2f}", "P&L": "£{:+.2f}", "Odds": "{:.2f}"}
     )
     st.dataframe(styled, use_container_width=True, hide_index=True)
 
-    # Totals row --------------------------------------------------------------
-    settled = df[df["Result"].isin(["WIN", "LOSS"])]
-    if not settled.empty:
+    settled_df = df[df["Result"].isin(["WIN", "LOSS"])]
+    if not settled_df.empty:
         st.markdown("---")
+        wins = int((settled_df["Result"] == "WIN").sum())
         t1, t2, t3, t4 = st.columns(4)
-        t1.metric("Total Bets", len(settled))
-        t2.metric("Total Staked", f"£{settled['Stake (£)'].sum():.2f}")
-        t3.metric("Net P&L", f"£{settled['Net P&L (£)'].sum():+.2f}")
-        wins = len(settled[settled["Result"] == "WIN"])
-        t4.metric("Win Rate", f"{wins/len(settled)*100:.1f}%")
+        t1.metric("Settled Bets", len(settled_df))
+        t2.metric("Total Staked", f"£{settled_df['Stake'].sum():.2f}")
+        t3.metric("Net P&L", f"£{settled_df['P&L'].sum():+.2f}")
+        t4.metric("Win Rate", f"{wins / len(settled_df) * 100:.1f}%")
+        _cards()
 
-    # CSV download ------------------------------------------------------------
-    csv_bytes = df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label="⬇️ Download CSV",
-        data=csv_bytes,
-        file_name=f"fibonacci_bets_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-    )
+    st.markdown("---")
+
+    # Downloads
+    dl1, dl2 = st.columns(2)
+
+    # CSV
+    with dl1:
+        st.download_button(
+            "Download CSV",
+            data=df.to_csv(index=False).encode("utf-8"),
+            file_name=f"fibonacci_bets_{datetime.now(timezone.utc).strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    # Excel (multi-sheet)
+    with dl2:
+        try:
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, sheet_name="Bet History", index=False)
+
+                if not settled_df.empty:
+                    monthly = (
+                        settled_df.assign(
+                            Month=pd.to_datetime(settled_df["Date"]).dt.to_period("M").astype(str)
+                        )
+                        .groupby("Month")
+                        .agg(
+                            Bets=("Result", "count"),
+                            Wins=("Result", lambda x: (x == "WIN").sum()),
+                            Staked=("Stake", "sum"),
+                            PnL=("P&L", "sum"),
+                        )
+                        .reset_index()
+                    )
+                    monthly["Win Rate %"] = (monthly["Wins"] / monthly["Bets"] * 100).round(1)
+                    monthly.to_excel(writer, sheet_name="Monthly Summary", index=False)
+
+                if not df.empty:
+                    league_summary = pd.DataFrame([
+                        {
+                            "League": lg,
+                            "Bets": len(g),
+                            "Wins": int((g["Result"] == "WIN").sum()),
+                            "Staked": round(g["Stake"].sum(), 2),
+                            "Net P&L": round(g["P&L"].sum(), 2),
+                            "Win Rate %": round((g["Result"] == "WIN").sum() / len(g) * 100, 1),
+                        }
+                        for lg, g in df.groupby("League")
+                    ])
+                    league_summary.to_excel(writer, sheet_name="By League", index=False)
+
+                seqs = db.get_active_sequences()
+                if seqs:
+                    pd.DataFrame(seqs).to_excel(writer, sheet_name="Sequences", index=False)
+
+            buf.seek(0)
+            st.download_button(
+                "Download Excel",
+                data=buf.read(),
+                file_name=f"fibonacci_bets_{datetime.now(timezone.utc).strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.caption(f"Excel export unavailable: {e}")
 
 
 # ===========================================================================
-# PAGE 4 — Backtester
+# PAGE — BACKTESTER
 # ===========================================================================
 
 def page_backtester():
-    st.title("🔬 Backtester")
+    _section("Backtester", "Simulate the Fibonacci system over historical data")
 
     settings = db.get_settings() or {}
     default_base = float(settings.get("base_stake", 10.0))
     default_min_odds = float(settings.get("min_odds", 2.88))
     default_max_step = int(settings.get("max_fib_step", 7))
 
-    tab_api, tab_csv = st.tabs(["📡 API-Football Backtest", "📂 CSV Upload"])
+    tab_api, tab_csv = st.tabs(["API-Football", "CSV Upload"])
 
-    # ------------------------------------------------------------------
-    # Tab 1 — API-Football
-    # ------------------------------------------------------------------
+    # ---- API-Football tab ----
     with tab_api:
-        st.markdown("Fetch a full historical season from API-Football and run the Fibonacci simulation.")
+        st.caption("Fetch a full historical season and simulate the strategy. Uses API quota.")
 
         all_leagues = db.get_leagues()
         if not all_leagues:
             all_leagues = [
-                {"league_key": f"league_{l['api_id']}", "league_name": l["league_name"], "api_id": l["api_id"]}
+                {
+                    "league_key": f"league_{l['api_id']}",
+                    "league_name": l["league_name"],
+                    "api_id": l["api_id"],
+                    "country": l.get("country", ""),
+                }
                 for l in league_scanner.SEED_LEAGUES
             ]
-
-        league_options = {l["league_key"]: f"{l.get('league_name', l['league_key'])} ({l.get('country', '')})" for l in all_leagues}
+        league_opts = {
+            l["league_key"]: f"{l.get('league_name', l['league_key'])} ({l.get('country', '')})"
+            for l in all_leagues
+        }
 
         ac1, ac2 = st.columns(2)
         with ac1:
-            sel_league_key = st.selectbox(
+            sel_key = st.selectbox(
                 "League",
-                options=list(league_options.keys()),
-                format_func=lambda k: league_options[k],
+                options=list(league_opts.keys()),
+                format_func=lambda k: league_opts[k],
             )
         with ac2:
-            season = st.selectbox("Season", options=[2024, 2023, 2022, 2021, 2020], index=0)
+            season = st.selectbox("Season", [2024, 2023, 2022, 2021, 2020])
 
         bc1, bc2, bc3 = st.columns(3)
         with bc1:
             bt_base = st.number_input("Base Stake (£)", value=default_base, min_value=1.0, step=1.0)
         with bc2:
-            bt_min_odds = st.number_input("Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0, step=0.01, format="%.2f")
+            bt_min_odds = st.number_input(
+                "Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0, step=0.01, format="%.2f"
+            )
         with bc3:
-            bt_max_step = st.slider("Max Fib Step", min_value=3, max_value=10, value=default_max_step)
+            bt_max_step = st.slider("Max Step", min_value=3, max_value=10, value=default_max_step)
 
         bt_default_odds = st.number_input(
-            "Default draw odds (used when historical odds unavailable)",
+            "Default draw odds (when historical odds unavailable)",
             value=3.0, min_value=1.5, max_value=6.0, step=0.05, format="%.2f",
         )
 
-        run_btn = st.button("▶️ Run Backtest", type="primary")
-
-        if run_btn or "bt_result" in st.session_state:
-            if run_btn:
-                # Identify api_id for the selected league
-                api_id = next(
-                    (l["api_id"] for l in all_leagues if l["league_key"] == sel_league_key), None
-                )
-                if not api_id:
-                    st.error("Could not determine API ID for this league.")
-                    st.stop()
-
-                with st.spinner(f"Fetching {season} season data from API-Football… (uses API quota)"):
-                    raw_fixtures = data_fetcher.fetch_historical_fixtures(api_id, season)
-
-                if not raw_fixtures:
-                    st.error("No historical data returned. Check your API key and quota.")
-                    st.stop()
-
-                matches = [
-                    {
-                        "home_goals": f["home_goals"],
-                        "away_goals": f["away_goals"],
-                        "draw_odds": bt_default_odds,
-                        "home_team": f["home_team"],
-                        "away_team": f["away_team"],
-                        "kickoff_utc": f.get("kickoff_utc", ""),
-                    }
-                    for f in raw_fixtures
-                ]
-
-                result = fibonacci_engine.simulate_season(matches, bt_base, bt_min_odds, bt_max_step)
-                result["_matches"] = matches
-                result["_label"] = f"{league_options[sel_league_key]} — {season}"
-                st.session_state["bt_result"] = result
-
-            # Display results -------------------------------------------------
-            r = st.session_state.get("bt_result", {})
-            if not r:
+        if st.button("Run Backtest", type="primary"):
+            api_id = next(
+                (l["api_id"] for l in all_leagues if l["league_key"] == sel_key), None
+            )
+            if not api_id:
+                st.error("Could not determine API ID for this league.")
                 st.stop()
 
-            st.success(f"Simulation complete: **{r['_label']}**")
+            with st.spinner("Fetching data from API-Football…"):
+                raw = data_fetcher.fetch_historical_fixtures(api_id, season)
+
+            if not raw:
+                st.error("No data returned — check API key and quota.")
+                st.stop()
+
+            matches = [
+                {
+                    "home_goals": f["home_goals"],
+                    "away_goals": f["away_goals"],
+                    "draw_odds": bt_default_odds,
+                    "home_team": f["home_team"],
+                    "away_team": f["away_team"],
+                }
+                for f in raw
+            ]
+            result = fibonacci_engine.simulate_season(matches, bt_base, bt_min_odds, bt_max_step)
+            result["_matches"] = matches
+            result["_label"] = f"{league_opts[sel_key]} — {season}"
+            st.session_state["bt_result"] = result
+
+        if "bt_result" in st.session_state:
+            r = st.session_state["bt_result"]
+            st.success(f"Simulation: **{r['_label']}**")
 
             m1, m2, m3, m4, m5 = st.columns(5)
             m1.metric("Total Bets", r["total_bets"])
-            m2.metric("Wins (draws)", r["wins"])
+            m2.metric("Wins", r["wins"])
             m3.metric("Draw Rate", f"{r['draw_rate']:.1f}%")
             m4.metric("Net P&L", f"£{r['net_pnl']:+.2f}")
             m5.metric("ROI", f"{r['roi']:+.2f}%")
@@ -579,107 +853,103 @@ def page_backtester():
             m6.metric("Total Staked", f"£{r['total_staked']:.2f}")
             m7.metric("Max Drawdown", f"£{r['max_drawdown']:.2f}")
             m8.metric("Longest Loss Streak", r["longest_loss_streak"])
+            _cards()
 
-            # P&L chart
             if r.get("pnl_series"):
-                df_pnl = pd.DataFrame(
-                    {"Bet #": range(1, len(r["pnl_series"]) + 1), "Cumulative P&L (£)": r["pnl_series"]}
-                )
-                fig = px.line(
-                    df_pnl,
-                    x="Bet #",
-                    y="Cumulative P&L (£)",
-                    title=f"Backtest P&L — {r['_label']}",
+                df_pnl = pd.DataFrame({
+                    "Bet #": range(1, len(r["pnl_series"]) + 1),
+                    "P&L": r["pnl_series"],
+                })
+                fig = px.area(
+                    df_pnl, x="Bet #", y="P&L",
                     color_discrete_sequence=["#00c853"],
                 )
+                fig.update_traces(fillcolor="rgba(0,200,83,0.07)", line_color="#00c853")
                 fig.update_layout(
-                    plot_bgcolor="#0e1117",
-                    paper_bgcolor="#0e1117",
-                    font_color="#fafafa",
-                    xaxis=dict(gridcolor="#2d3140"),
-                    yaxis=dict(gridcolor="#2d3140", zeroline=True, zerolinecolor="#555"),
+                    plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12", font_color="#9ca3af",
+                    xaxis=dict(gridcolor="#1a1e2a"),
+                    yaxis=dict(gridcolor="#1a1e2a", zeroline=True, zerolinecolor="#374151"),
+                    title=f"Backtest P&L — {r['_label']}",
+                    title_font=dict(color="#e2e5eb", size=13),
+                    margin=dict(l=0, r=0, t=35, b=0),
                 )
-                fig.add_hline(y=0, line_dash="dash", line_color="#555")
+                fig.add_hline(y=0, line_dash="dot", line_color="#374151")
                 st.plotly_chart(fig, use_container_width=True)
 
-            # Match-level breakdown table
             if r.get("_matches"):
-                with st.expander("📋 Match breakdown"):
-                    df_matches = pd.DataFrame(r["_matches"])
-                    if "home_goals" in df_matches.columns:
-                        df_matches["draw"] = df_matches["home_goals"] == df_matches["away_goals"]
-                    st.dataframe(df_matches, use_container_width=True, hide_index=True)
+                with st.expander("Match breakdown"):
+                    df_m = pd.DataFrame(r["_matches"])
+                    if "home_goals" in df_m.columns:
+                        df_m["Draw"] = df_m["home_goals"] == df_m["away_goals"]
+                    st.dataframe(df_m, use_container_width=True, hide_index=True)
 
-    # ------------------------------------------------------------------
-    # Tab 2 — CSV Upload
-    # ------------------------------------------------------------------
+    # ---- CSV tab ----
     with tab_csv:
-        st.markdown(
-            "Upload a CSV with columns: `date`, `home_team`, `away_team`, "
-            "`home_goals`, `away_goals`, `draw_odds`"
+        st.caption(
+            "Upload a CSV with columns: "
+            "`home_team`, `away_team`, `home_goals`, `away_goals`, `draw_odds`"
         )
-
-        uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
+        uploaded = st.file_uploader("Choose CSV", type=["csv"])
 
         cc1, cc2, cc3 = st.columns(3)
         with cc1:
-            csv_base = st.number_input("Base Stake (£)", value=default_base, min_value=1.0, step=1.0, key="csv_base")
+            csv_base = st.number_input(
+                "Base Stake (£)", value=default_base, min_value=1.0, step=1.0, key="csv_base"
+            )
         with cc2:
-            csv_min_odds = st.number_input("Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0, step=0.01, format="%.2f", key="csv_min")
+            csv_min = st.number_input(
+                "Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0,
+                step=0.01, format="%.2f", key="csv_min",
+            )
         with cc3:
-            csv_max_step = st.slider("Max Fib Step", min_value=3, max_value=10, value=default_max_step, key="csv_step")
+            csv_step = st.slider(
+                "Max Step", min_value=3, max_value=10, value=default_max_step, key="csv_step"
+            )
 
-        if uploaded and st.button("▶️ Run CSV Simulation", type="primary"):
+        if uploaded and st.button("Run CSV Simulation", type="primary"):
             try:
                 df_csv = pd.read_csv(uploaded)
-                required = {"home_goals", "away_goals", "draw_odds"}
-                missing = required - set(df_csv.columns)
-                if missing:
-                    st.error(f"CSV missing required columns: {missing}")
+                missing_cols = {"home_goals", "away_goals", "draw_odds"} - set(df_csv.columns)
+                if missing_cols:
+                    st.error(f"Missing required columns: {missing_cols}")
                     st.stop()
 
                 matches = df_csv[["home_goals", "away_goals", "draw_odds"]].to_dict("records")
-                csv_result = fibonacci_engine.simulate_season(matches, csv_base, csv_min_odds, csv_max_step)
+                res = fibonacci_engine.simulate_season(matches, csv_base, csv_min, csv_step)
 
                 st.success(f"Simulation over {len(matches)} matches complete.")
-
                 mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("Net P&L", f"£{csv_result['net_pnl']:+.2f}")
-                mc2.metric("ROI", f"{csv_result['roi']:+.2f}%")
-                mc3.metric("Draw Rate", f"{csv_result['draw_rate']:.1f}%")
-                mc4.metric("Max Drawdown", f"£{csv_result['max_drawdown']:.2f}")
+                mc1.metric("Net P&L", f"£{res['net_pnl']:+.2f}")
+                mc2.metric("ROI", f"{res['roi']:+.2f}%")
+                mc3.metric("Draw Rate", f"{res['draw_rate']:.1f}%")
+                mc4.metric("Max Drawdown", f"£{res['max_drawdown']:.2f}")
+                _cards()
 
-                if csv_result.get("pnl_series"):
-                    df_pnl = pd.DataFrame(
-                        {
-                            "Bet #": range(1, len(csv_result["pnl_series"]) + 1),
-                            "Cumulative P&L (£)": csv_result["pnl_series"],
-                        }
-                    )
-                    fig = px.line(
-                        df_pnl,
-                        x="Bet #",
-                        y="Cumulative P&L (£)",
-                        title="CSV Backtest — Cumulative P&L",
+                if res.get("pnl_series"):
+                    fig = px.area(
+                        pd.DataFrame({
+                            "Bet #": range(1, len(res["pnl_series"]) + 1),
+                            "P&L": res["pnl_series"],
+                        }),
+                        x="Bet #", y="P&L",
                         color_discrete_sequence=["#00c853"],
                     )
+                    fig.update_traces(fillcolor="rgba(0,200,83,0.07)")
                     fig.update_layout(
-                        plot_bgcolor="#0e1117",
-                        paper_bgcolor="#0e1117",
-                        font_color="#fafafa",
+                        plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12", font_color="#9ca3af"
                     )
                     st.plotly_chart(fig, use_container_width=True)
 
             except Exception as e:
-                st.error(f"Error processing CSV: {e}")
+                st.error(f"Error: {e}")
 
 
 # ===========================================================================
-# PAGE 5 — League Scanner
+# PAGE — LEAGUES
 # ===========================================================================
 
-def page_league_scanner():
-    st.title("🏆 League Scanner")
+def page_leagues():
+    _section("League Scanner", "Draw-rate rankings and activation")
 
     if not _db_connected():
         st.error("Database not connected.")
@@ -687,73 +957,90 @@ def page_league_scanner():
 
     leagues = db.get_leagues()
 
-    # Header actions ----------------------------------------------------------
-    sc1, sc2, sc3 = st.columns([2, 1, 2])
+    sc1, sc2 = st.columns([2, 4])
     with sc1:
-        if st.button("🔍 Re-Scan Now (costs API quota)", type="primary"):
-            with st.spinner("Scanning league draw rates — this may take a minute…"):
+        if st.button("Re-Scan Now  (costs API quota)", type="primary"):
+            with st.spinner("Scanning league draw rates…"):
                 leagues = league_scanner.update_league_draw_rates()
-            st.success(f"Scan complete. {len(leagues)} leagues updated.")
+            st.success(f"Scan complete — {len(leagues)} leagues updated.")
             st.rerun()
 
-    last_scanned = max(
-        (l.get("last_scanned") or "" for l in leagues), default=""
-    )
-    if last_scanned:
-        with sc3:
-            st.caption(f"Last scan: {last_scanned[:16].replace('T', ' ')} UTC")
+    last_scan = max((l.get("last_scanned") or "" for l in leagues), default="")
+    if last_scan:
+        with sc2:
+            st.caption(f"Last scan: {last_scan[:16].replace('T', ' ')} UTC")
 
     if not leagues:
-        st.info("No leagues scanned yet. Click Re-Scan to populate.")
+        st.info("No leagues yet — click Re-Scan to populate.")
         return
 
-    # Leagues table -----------------------------------------------------------
     st.markdown("---")
-    st.subheader("League Rankings")
+
+    # Table header
+    hdr = st.columns([2.5, 1.5, 1.3, 1.2, 1.5, 1.2])
+    for col, lbl in zip(hdr, ["League", "Country", "Draw Rate", "Score", "Status", "Active"]):
+        col.markdown(
+            f"<span style='font-size:0.71rem; color:#4b5563; text-transform:uppercase; "
+            f"letter-spacing:0.09em;'>{lbl}</span>",
+            unsafe_allow_html=True,
+        )
 
     for league in leagues:
         lk = league.get("league_key", "")
         is_active = bool(league.get("is_active", False))
         draw_pct = round(float(league.get("draw_rate_season") or 0) * 100, 1)
-        score = float(league.get("score") or 0) if league.get("score") else (draw_pct)
+        score = float(league.get("score") or draw_pct)
 
-        rec_icon = "⭐" if draw_pct >= 28 else ""
-        active_badge = "🟢 Active" if is_active else "⚫ Inactive"
+        row = st.columns([2.5, 1.5, 1.3, 1.2, 1.5, 1.2])
 
-        row_c1, row_c2, row_c3, row_c4, row_c5, row_c6 = st.columns(
-            [2.5, 1.5, 1.2, 1.2, 1.5, 1.5]
+        name_html = f"<b>{league.get('league_name', lk)}</b>"
+        if draw_pct >= 28:
+            name_html += " <span style='color:#f59e0b; font-size:0.72rem; font-weight:700;'>TOP</span>"
+        row[0].markdown(name_html, unsafe_allow_html=True)
+
+        row[1].markdown(
+            f"<span style='color:#6b7280; font-size:0.88rem;'>{league.get('country', '')}</span>",
+            unsafe_allow_html=True,
         )
-        row_c1.markdown(f"**{league.get('league_name', lk)}** {rec_icon}")
-        row_c2.markdown(league.get("country", ""))
-        row_c3.markdown(f"**{draw_pct:.1f}%** draws")
-        row_c4.markdown(f"Score: **{score:.1f}**")
-        row_c5.markdown(active_badge)
+        row[2].markdown(f"**{draw_pct:.1f}%**")
+        row[3].markdown(f"{score:.1f}")
 
-        with row_c6:
+        s_col = "#00c853" if is_active else "#374151"
+        s_txt = "ACTIVE" if is_active else "OFF"
+        row[4].markdown(
+            f"<span style='color:{s_col}; font-size:0.77rem; font-weight:700; "
+            f"letter-spacing:0.06em;'>{s_txt}</span>",
+            unsafe_allow_html=True,
+        )
+
+        with row[5]:
             new_active = st.toggle(
-                "Activate",
+                "Toggle",
                 value=is_active,
-                key=f"toggle_{lk}",
+                key=f"tgl_{lk}",
                 label_visibility="collapsed",
             )
             if new_active != is_active:
                 db.upsert_league({**league, "is_active": new_active})
                 st.rerun()
 
-    # Seed leagues not yet in DB ----------------------------------------------
     existing_keys = {l["league_key"] for l in leagues}
     missing = [l for l in league_scanner.SEED_LEAGUES if l["league_key"] not in existing_keys]
     if missing:
-        with st.expander(f"ℹ️ {len(missing)} seed leagues not yet scanned"):
-            st.table(pd.DataFrame(missing)[["league_name", "country", "api_id"]])
+        with st.expander(f"{len(missing)} seed leagues not yet scanned"):
+            st.dataframe(
+                pd.DataFrame(missing)[["league_name", "country", "api_id"]],
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 # ===========================================================================
-# PAGE 6 — Settings
+# PAGE — SETTINGS
 # ===========================================================================
 
 def page_settings():
-    st.title("⚙️ Settings")
+    _section("Settings", "Staking parameters and system configuration")
 
     if not _db_connected():
         st.error("Database not connected.")
@@ -762,12 +1049,10 @@ def page_settings():
     settings = db.get_settings() or {}
 
     with st.form("settings_form"):
-        st.subheader("Staking Parameters")
-
         sc1, sc2 = st.columns(2)
         with sc1:
             base_stake = st.number_input(
-                "Base Stake (£) — step 1 stake",
+                "Base Stake (£) — step 1 amount",
                 value=float(settings.get("base_stake") or 10.0),
                 min_value=1.0,
                 step=1.0,
@@ -786,7 +1071,6 @@ def page_settings():
                 step=0.1,
                 format="%.1f",
             )
-
         with sc2:
             min_odds = st.slider(
                 "Minimum draw odds",
@@ -805,21 +1089,20 @@ def page_settings():
 
         st.markdown("---")
 
-        # Preview the stake ladder
         FIBONACCI = [1, 1, 2, 3, 5, 8, 13, 21, 34, 55]
         preview = [
             {
                 "Step": i + 1,
-                "Multiplier": FIBONACCI[i],
-                "Stake (£)": round(base_stake * FIBONACCI[i], 2),
-                "Status": "✅" if (i + 1) <= 3 else "⚠️" if (i + 1) <= 5 else "🚨",
+                "Multiplier": f"×{FIBONACCI[i]}",
+                "Stake (£)": f"£{base_stake * FIBONACCI[i]:.2f}",
+                "Risk": "SAFE" if i < 3 else "CAUTION" if i < 5 else "HIGH",
             }
             for i in range(max_fib_step)
         ]
-        st.markdown("**Fibonacci stake ladder preview:**")
+        st.caption("Fibonacci stake ladder preview:")
         st.dataframe(pd.DataFrame(preview), hide_index=True, use_container_width=False)
 
-        submitted = st.form_submit_button("💾 Save Settings", type="primary")
+        submitted = st.form_submit_button("Save Settings", type="primary")
         if submitted:
             ok = db.update_settings(
                 base_stake=base_stake,
@@ -828,34 +1111,46 @@ def page_settings():
                 bankroll=bankroll,
                 commission_pct=commission_pct,
             )
-            if ok:
-                st.success("Settings saved.")
-            else:
-                st.error("Failed to save settings — check DB connection.")
+            st.success("Settings saved.") if ok else st.error("Failed to save — check DB connection.")
 
-    # API usage ---------------------------------------------------------------
+    # Ruin probability info (outside form so it updates with current DB values)
     st.markdown("---")
-    st.subheader("API Usage")
+    try:
+        active_leagues = [l for l in db.get_leagues() if l.get("is_active")]
+        active_rates = [float(l.get("draw_rate_season") or 0) for l in active_leagues]
+        avg_rate = sum(active_rates) / len(active_rates) if active_rates else 0.27
+        cur_max_step = int(settings.get("max_fib_step") or 7)
+        p = _ruin_prob(avg_rate, cur_max_step)
+        st.info(
+            f"At **{avg_rate * 100:.1f}%** avg draw rate across "
+            f"{len(active_leagues)} active league(s) and max step **{cur_max_step}**: "
+            f"series ruin probability = **{p:.2f}%**  "
+            f"(i.e. 1 in {round(100/p) if p > 0 else 'never'} series ends in stop-loss)"
+        )
+    except Exception:
+        pass
 
+    # API usage
+    st.markdown("---")
+    _section("API Usage", "")
     api_calls = data_fetcher.get_api_calls_today()
     pct = min(api_calls / 100, 1.0)
+    _c = "#ef4444" if pct > 0.9 else "#f59e0b" if pct > 0.7 else "#00c853"
 
-    col_a, col_b = st.columns([3, 1])
-    with col_a:
-        colour = "#ff4444" if pct > 0.9 else "#ffc107" if pct > 0.7 else "#00c853"
+    ca, cb = st.columns([3, 1])
+    with ca:
         st.markdown(
-            f"<div style='margin-bottom:4px'>API calls today: "
-            f"<strong style='color:{colour}'>{api_calls}/100</strong></div>",
+            f"<div style='margin-bottom:4px; font-size:0.9rem;'>"
+            f"Calls today: <strong style='color:{_c};'>{api_calls}/100</strong></div>",
             unsafe_allow_html=True,
         )
         st.progress(pct)
-    with col_b:
+    with cb:
         st.metric("Remaining", 100 - api_calls)
+        _cards()
 
     st.caption(
-        "The API-Football free tier allows 100 calls/day. "
-        "The app refuses calls at 95 to leave a safety buffer. "
-        "Counter resets at midnight UTC."
+        "Free tier: 100 calls/day. App blocks at 95. Counter resets at midnight UTC."
     )
 
 
@@ -863,15 +1158,15 @@ def page_settings():
 # Router
 # ===========================================================================
 
-if page == "🎯 Today's Bets":
-    page_today_bets()
-elif page == "📊 Dashboard":
+if page == "Today":
+    page_today()
+elif page == "Dashboard":
     page_dashboard()
-elif page == "📋 Bet History":
-    page_bet_history()
-elif page == "🔬 Backtester":
+elif page == "History":
+    page_history()
+elif page == "Backtester":
     page_backtester()
-elif page == "🏆 League Scanner":
-    page_league_scanner()
-elif page == "⚙️ Settings":
+elif page == "Leagues":
+    page_leagues()
+elif page == "Settings":
     page_settings()

@@ -5,3 +5,5 @@ pandas
 plotly
 python-dotenv
 APScheduler
+streamlit-extras
+openpyxl
