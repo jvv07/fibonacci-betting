@@ -753,6 +753,52 @@ def page_history():
 # PAGE — BACKTESTER
 # ===========================================================================
 
+def _render_sim_results(r: dict, label: str) -> None:
+    """Shared result display used by all three backtester tabs."""
+    st.success(f"Simulation complete: **{label}**")
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Matches", r["total_bets"])
+    m2.metric("Wins (Draws)", r["wins"])
+    m3.metric("Draw Rate", f"{r['draw_rate']:.1f}%")
+    m4.metric("Net P&L", f"£{r['net_pnl']:+.2f}")
+    m5.metric("ROI", f"{r['roi']:+.2f}%")
+
+    m6, m7, m8 = st.columns(3)
+    m6.metric("Total Staked", f"£{r['total_staked']:.2f}")
+    m7.metric("Max Drawdown", f"£{r['max_drawdown']:.2f}")
+    m8.metric("Longest Loss Streak", r["longest_loss_streak"])
+    _cards()
+
+    if r.get("pnl_series"):
+        fig = px.area(
+            pd.DataFrame({
+                "Bet #": range(1, len(r["pnl_series"]) + 1),
+                "P&L (£)": r["pnl_series"],
+            }),
+            x="Bet #", y="P&L (£)",
+            color_discrete_sequence=["#00c853"],
+        )
+        fig.update_traces(fillcolor="rgba(0,200,83,0.07)", line_color="#00c853", line_width=2)
+        fig.update_layout(
+            plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12", font_color="#9ca3af",
+            xaxis=dict(gridcolor="#1a1e2a"),
+            yaxis=dict(gridcolor="#1a1e2a", zeroline=True, zerolinecolor="#374151"),
+            title=label,
+            title_font=dict(color="#e2e5eb", size=13),
+            margin=dict(l=0, r=0, t=35, b=0),
+        )
+        fig.add_hline(y=0, line_dash="dot", line_color="#374151")
+        st.plotly_chart(fig, use_container_width=True)
+
+    if r.get("_matches"):
+        with st.expander("Match breakdown"):
+            df_m = pd.DataFrame(r["_matches"])
+            if "home_goals" in df_m.columns and "away_goals" in df_m.columns:
+                df_m["Draw"] = df_m["home_goals"] == df_m["away_goals"]
+            st.dataframe(df_m, use_container_width=True, hide_index=True)
+
+
 def page_backtester():
     _section("Backtester", "Simulate the Fibonacci system over historical data")
 
@@ -761,133 +807,187 @@ def page_backtester():
     default_min_odds = float(settings.get("min_odds", 2.88))
     default_max_step = int(settings.get("max_fib_step", 7))
 
-    tab_api, tab_csv = st.tabs(["API-Football", "CSV Upload"])
+    tab_fdco, tab_api, tab_csv = st.tabs(
+        ["Free Data (19 leagues)", "API-Football", "CSV Upload"]
+    )
 
-    # ---- API-Football tab ----
-    with tab_api:
-        st.caption("Fetch a full historical season and simulate the strategy. Uses API quota.")
-
-        all_leagues = db.get_leagues()
-        if not all_leagues:
-            all_leagues = [
-                {
-                    "league_key": f"league_{l['api_id']}",
-                    "league_name": l["league_name"],
-                    "api_id": l["api_id"],
-                    "country": l.get("country", ""),
-                }
-                for l in league_scanner.SEED_LEAGUES
-            ]
-        league_opts = {
-            l["league_key"]: f"{l.get('league_name', l['league_key'])} ({l.get('country', '')})"
-            for l in all_leagues
-        }
-
-        ac1, ac2 = st.columns(2)
-        with ac1:
-            sel_key = st.selectbox(
-                "League",
-                options=list(league_opts.keys()),
-                format_func=lambda k: league_opts[k],
-            )
-        with ac2:
-            season = st.selectbox("Season", [2024, 2023, 2022, 2021, 2020])
-
-        bc1, bc2, bc3 = st.columns(3)
-        with bc1:
-            bt_base = st.number_input("Base Stake (£)", value=default_base, min_value=1.0, step=1.0)
-        with bc2:
-            bt_min_odds = st.number_input(
-                "Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0, step=0.01, format="%.2f"
-            )
-        with bc3:
-            bt_max_step = st.slider("Max Step", min_value=3, max_value=10, value=default_max_step)
-
-        bt_default_odds = st.number_input(
-            "Default draw odds (when historical odds unavailable)",
-            value=3.0, min_value=1.5, max_value=6.0, step=0.05, format="%.2f",
+    # =========================================================
+    # TAB 1 — football-data.co.uk  (no API key, always works)
+    # =========================================================
+    with tab_fdco:
+        st.caption(
+            "Real historical match results + Bet365 draw odds from "
+            "[football-data.co.uk](https://www.football-data.co.uk) — "
+            "**no API key required**, completely free."
         )
 
-        if st.button("Run Backtest", type="primary"):
-            api_id = next(
-                (l["api_id"] for l in all_leagues if l["league_key"] == sel_key), None
+        fdco_names = list(data_fetcher.FDCO_LEAGUES.keys())
+
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            fdco_league = st.selectbox("League", fdco_names, key="fdco_league")
+        with fc2:
+            fdco_season = st.selectbox(
+                "Season (start year)", [2024, 2023, 2022, 2021, 2020], key="fdco_season"
             )
-            if not api_id:
-                st.error("Could not determine API ID for this league.")
+
+        fb1, fb2, fb3 = st.columns(3)
+        with fb1:
+            fdco_base = st.number_input(
+                "Base Stake (£)", value=default_base, min_value=1.0, step=1.0, key="fdco_base"
+            )
+        with fb2:
+            fdco_min_odds = st.number_input(
+                "Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0,
+                step=0.01, format="%.2f", key="fdco_min",
+            )
+        with fb3:
+            fdco_max_step = st.slider(
+                "Max Step", min_value=3, max_value=10, value=default_max_step, key="fdco_step"
+            )
+
+        if st.button("Run Backtest", type="primary", key="fdco_run"):
+            league_code = data_fetcher.FDCO_LEAGUES[fdco_league]
+            season_label = f"{fdco_season}/{str(fdco_season + 1)[2:]}"
+
+            with st.spinner(f"Downloading {fdco_league} {season_label}…"):
+                matches = data_fetcher.fetch_historical_from_fdco(league_code, fdco_season)
+
+            if not matches:
+                st.error(
+                    f"No data for **{fdco_league} {season_label}**. "
+                    "The season may not be available yet, or try a different season."
+                )
                 st.stop()
 
-            with st.spinner("Fetching data from API-Football…"):
-                raw = data_fetcher.fetch_historical_fixtures(api_id, season)
-
-            if not raw:
-                st.error("No data returned — check API key and quota.")
-                st.stop()
-
-            matches = [
-                {
-                    "home_goals": f["home_goals"],
-                    "away_goals": f["away_goals"],
-                    "draw_odds": bt_default_odds,
-                    "home_team": f["home_team"],
-                    "away_team": f["away_team"],
-                }
-                for f in raw
-            ]
-            result = fibonacci_engine.simulate_season(matches, bt_base, bt_min_odds, bt_max_step)
+            result = fibonacci_engine.simulate_season(
+                matches, fdco_base, fdco_min_odds, fdco_max_step
+            )
             result["_matches"] = matches
-            result["_label"] = f"{league_opts[sel_key]} — {season}"
-            st.session_state["bt_result"] = result
+            st.session_state["fdco_result"] = (result, f"{fdco_league} {season_label}")
 
-        if "bt_result" in st.session_state:
-            r = st.session_state["bt_result"]
-            st.success(f"Simulation: **{r['_label']}**")
+        if "fdco_result" in st.session_state:
+            r, lbl = st.session_state["fdco_result"]
+            _render_sim_results(r, lbl)
 
-            m1, m2, m3, m4, m5 = st.columns(5)
-            m1.metric("Total Bets", r["total_bets"])
-            m2.metric("Wins", r["wins"])
-            m3.metric("Draw Rate", f"{r['draw_rate']:.1f}%")
-            m4.metric("Net P&L", f"£{r['net_pnl']:+.2f}")
-            m5.metric("ROI", f"{r['roi']:+.2f}%")
+    # =========================================================
+    # TAB 2 — API-Football
+    # =========================================================
+    with tab_api:
+        # Check API status once per session (doesn't use quota)
+        if "api_status" not in st.session_state:
+            is_susp, susp_msg = data_fetcher.check_api_suspended()
+            st.session_state["api_status"] = (is_susp, susp_msg)
 
-            m6, m7, m8 = st.columns(3)
-            m6.metric("Total Staked", f"£{r['total_staked']:.2f}")
-            m7.metric("Max Drawdown", f"£{r['max_drawdown']:.2f}")
-            m8.metric("Longest Loss Streak", r["longest_loss_streak"])
-            _cards()
+        is_suspended, susp_msg = st.session_state["api_status"]
 
-            if r.get("pnl_series"):
-                df_pnl = pd.DataFrame({
-                    "Bet #": range(1, len(r["pnl_series"]) + 1),
-                    "P&L": r["pnl_series"],
-                })
-                fig = px.area(
-                    df_pnl, x="Bet #", y="P&L",
-                    color_discrete_sequence=["#00c853"],
+        if is_suspended:
+            st.error(
+                f"**API-Football account issue:** {susp_msg}\n\n"
+                "Visit [dashboard.api-football.com](https://dashboard.api-football.com) "
+                "to check your account. In the meantime, use the **Free Data** tab — "
+                "it works without any API key and includes real Bet365 odds."
+            )
+            if st.button("Re-check API status", key="recheck_api"):
+                del st.session_state["api_status"]
+                st.rerun()
+        else:
+            st.caption("Fetch a full historical season from API-Football. Uses API quota.")
+
+            all_leagues = db.get_leagues()
+            if not all_leagues:
+                all_leagues = [
+                    {
+                        "league_key": f"league_{l['api_id']}",
+                        "league_name": l["league_name"],
+                        "api_id": l["api_id"],
+                        "country": l.get("country", ""),
+                    }
+                    for l in league_scanner.SEED_LEAGUES
+                ]
+            league_opts = {
+                l["league_key"]: f"{l.get('league_name', l['league_key'])} ({l.get('country', '')})"
+                for l in all_leagues
+            }
+
+            ac1, ac2 = st.columns(2)
+            with ac1:
+                sel_key = st.selectbox(
+                    "League", options=list(league_opts.keys()),
+                    format_func=lambda k: league_opts[k], key="api_league",
                 )
-                fig.update_traces(fillcolor="rgba(0,200,83,0.07)", line_color="#00c853")
-                fig.update_layout(
-                    plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12", font_color="#9ca3af",
-                    xaxis=dict(gridcolor="#1a1e2a"),
-                    yaxis=dict(gridcolor="#1a1e2a", zeroline=True, zerolinecolor="#374151"),
-                    title=f"Backtest P&L — {r['_label']}",
-                    title_font=dict(color="#e2e5eb", size=13),
-                    margin=dict(l=0, r=0, t=35, b=0),
+            with ac2:
+                api_season = st.selectbox("Season", [2024, 2023, 2022, 2021, 2020], key="api_season")
+
+            bc1, bc2, bc3 = st.columns(3)
+            with bc1:
+                bt_base = st.number_input(
+                    "Base Stake (£)", value=default_base, min_value=1.0, step=1.0, key="api_base"
                 )
-                fig.add_hline(y=0, line_dash="dot", line_color="#374151")
-                st.plotly_chart(fig, use_container_width=True)
+            with bc2:
+                bt_min_odds = st.number_input(
+                    "Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0,
+                    step=0.01, format="%.2f", key="api_min",
+                )
+            with bc3:
+                bt_max_step = st.slider(
+                    "Max Step", min_value=3, max_value=10, value=default_max_step, key="api_step"
+                )
 
-            if r.get("_matches"):
-                with st.expander("Match breakdown"):
-                    df_m = pd.DataFrame(r["_matches"])
-                    if "home_goals" in df_m.columns:
-                        df_m["Draw"] = df_m["home_goals"] == df_m["away_goals"]
-                    st.dataframe(df_m, use_container_width=True, hide_index=True)
+            bt_default_odds = st.number_input(
+                "Default draw odds (when historical odds unavailable)",
+                value=3.0, min_value=1.5, max_value=6.0, step=0.05, format="%.2f",
+            )
 
-    # ---- CSV tab ----
+            if st.button("Run API Backtest", type="primary", key="api_run"):
+                api_id = next(
+                    (l["api_id"] for l in all_leagues if l["league_key"] == sel_key), None
+                )
+                if not api_id:
+                    st.error("Could not determine API ID for this league.")
+                    st.stop()
+
+                with st.spinner("Fetching data from API-Football…"):
+                    raw = data_fetcher.fetch_historical_fixtures(api_id, api_season)
+
+                if not raw:
+                    st.error(
+                        "No data returned. Check your account at "
+                        "[dashboard.api-football.com](https://dashboard.api-football.com) "
+                        "or use the Free Data tab."
+                    )
+                    st.stop()
+
+                matches = [
+                    {
+                        "home_goals": f["home_goals"],
+                        "away_goals": f["away_goals"],
+                        "draw_odds": bt_default_odds,
+                        "home_team": f["home_team"],
+                        "away_team": f["away_team"],
+                    }
+                    for f in raw
+                ]
+                result = fibonacci_engine.simulate_season(
+                    matches, bt_base, bt_min_odds, bt_max_step
+                )
+                result["_matches"] = matches
+                st.session_state["api_bt_result"] = (result, f"{league_opts[sel_key]} — {api_season}")
+
+            if "api_bt_result" in st.session_state:
+                r, lbl = st.session_state["api_bt_result"]
+                _render_sim_results(r, lbl)
+
+    # =========================================================
+    # TAB 3 — CSV Upload
+    # =========================================================
     with tab_csv:
         st.caption(
-            "Upload a CSV with columns: "
-            "`home_team`, `away_team`, `home_goals`, `away_goals`, `draw_odds`"
+            "Upload your own CSV. Required columns: "
+            "`home_goals`, `away_goals`, `draw_odds`. "
+            "Download free CSVs from "
+            "[football-data.co.uk/data.php](https://www.football-data.co.uk/data.php) "
+            "for any league not in the Free Data tab."
         )
         uploaded = st.file_uploader("Choose CSV", type=["csv"])
 
@@ -906,7 +1006,7 @@ def page_backtester():
                 "Max Step", min_value=3, max_value=10, value=default_max_step, key="csv_step"
             )
 
-        if uploaded and st.button("Run CSV Simulation", type="primary"):
+        if uploaded and st.button("Run CSV Simulation", type="primary", key="csv_run"):
             try:
                 df_csv = pd.read_csv(uploaded)
                 missing_cols = {"home_goals", "away_goals", "draw_odds"} - set(df_csv.columns)
@@ -916,32 +1016,15 @@ def page_backtester():
 
                 matches = df_csv[["home_goals", "away_goals", "draw_odds"]].to_dict("records")
                 res = fibonacci_engine.simulate_season(matches, csv_base, csv_min, csv_step)
-
-                st.success(f"Simulation over {len(matches)} matches complete.")
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                mc1.metric("Net P&L", f"£{res['net_pnl']:+.2f}")
-                mc2.metric("ROI", f"{res['roi']:+.2f}%")
-                mc3.metric("Draw Rate", f"{res['draw_rate']:.1f}%")
-                mc4.metric("Max Drawdown", f"£{res['max_drawdown']:.2f}")
-                _cards()
-
-                if res.get("pnl_series"):
-                    fig = px.area(
-                        pd.DataFrame({
-                            "Bet #": range(1, len(res["pnl_series"]) + 1),
-                            "P&L": res["pnl_series"],
-                        }),
-                        x="Bet #", y="P&L",
-                        color_discrete_sequence=["#00c853"],
-                    )
-                    fig.update_traces(fillcolor="rgba(0,200,83,0.07)")
-                    fig.update_layout(
-                        plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12", font_color="#9ca3af"
-                    )
-                    st.plotly_chart(fig, use_container_width=True)
+                res["_matches"] = df_csv.to_dict("records")
+                st.session_state["csv_result"] = (res, f"CSV — {uploaded.name}")
 
             except Exception as e:
                 st.error(f"Error: {e}")
+
+        if "csv_result" in st.session_state:
+            r, lbl = st.session_state["csv_result"]
+            _render_sim_results(r, lbl)
 
 
 # ===========================================================================

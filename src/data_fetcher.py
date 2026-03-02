@@ -240,17 +240,37 @@ def fetch_historical_fixtures(league_id: int, season: int) -> list[dict]:
 
     Returns a list of dicts:
         fixture_id, home_team, away_team, home_goals, away_goals, kickoff_utc
+
+    Note: tries without status filter first (more compatible), then filters
+    for finished matches in Python.
     """
-    data = _get("fixtures", {"league": league_id, "season": season, "status": "FT"})
-    if not data or not data.get("response"):
+    # Try without status filter — more compatible with free-tier plans
+    data = _get("fixtures", {"league": league_id, "season": season})
+    if not data:
         return []
 
+    # Surface any API-level errors (e.g. suspended account)
+    if data.get("errors"):
+        print(f"[data_fetcher] fetch_historical_fixtures API error: {data['errors']}")
+        return []
+
+    response = data.get("response", [])
+    if not response:
+        # Fallback: try with explicit status filter
+        data2 = _get("fixtures", {"league": league_id, "season": season, "status": "FT"})
+        if data2 and not data2.get("errors"):
+            response = data2.get("response", [])
+
     results: list[dict] = []
-    for item in data["response"]:
+    for item in response:
         try:
             fix = item["fixture"]
             teams = item["teams"]
             goals = item["goals"]
+            status = fix.get("status", {}).get("short", "")
+            # Only include fully finished matches
+            if status not in ("FT", "AET", "PEN"):
+                continue
             results.append(
                 {
                     "fixture_id": fix["id"],
@@ -264,3 +284,137 @@ def fetch_historical_fixtures(league_id: int, season: int) -> list[dict]:
         except (KeyError, TypeError):
             continue
     return results
+
+
+# ---------------------------------------------------------------------------
+# Football-data.co.uk — free public historical data (no API key required)
+# ---------------------------------------------------------------------------
+
+# Mapping from display label → football-data.co.uk file code
+FDCO_LEAGUES: dict[str, str] = {
+    "England — Premier League":   "E0",
+    "England — Championship":     "E1",
+    "England — League One":       "E2",
+    "England — League Two":       "E3",
+    "Germany — Bundesliga":       "D1",
+    "Germany — 2. Bundesliga":    "D2",
+    "Italy — Serie A":            "I1",
+    "Italy — Serie B":            "I2",
+    "Spain — La Liga":            "SP1",
+    "Spain — Segunda División":   "SP2",
+    "France — Ligue 1":           "F1",
+    "France — Ligue 2":           "F2",
+    "Netherlands — Eredivisie":   "N1",
+    "Belgium — First Division A": "B1",
+    "Portugal — Primeira Liga":   "P1",
+    "Turkey — Süper Lig":         "T1",
+    "Greece — Super League":      "G1",
+    "Scotland — Premiership":     "SC0",
+    "Scotland — Championship":    "SC1",
+}
+
+_FDCO_BASE = "https://www.football-data.co.uk/mmz4281"
+
+
+def _fdco_season_code(season: int) -> str:
+    """Convert start-year integer to football-data.co.uk folder code.
+
+    e.g. 2024 → '2425'  (season runs 2024-25)
+         2020 → '2021'
+    """
+    return f"{str(season)[2:]}{str(season + 1)[2:]}"
+
+
+def fetch_historical_from_fdco(league_code: str, season: int) -> list[dict]:
+    """
+    Download historical match data from football-data.co.uk.
+    No API key required — completely free public source.
+
+    Args:
+        league_code: FDCO code, e.g. 'E1' for Championship, 'I1' for Serie A.
+        season     : Start year of the season, e.g. 2024 for 2024-25.
+
+    Returns:
+        List of dicts with keys: home_team, away_team, home_goals, away_goals,
+        draw_odds (real Bet365 historical odds), kickoff_utc.
+    """
+    import csv as csv_mod
+    import io as io_mod
+
+    season_str = _fdco_season_code(season)
+    url = f"{_FDCO_BASE}/{season_str}/{league_code}.csv"
+
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        print(f"[data_fetcher] fetch_historical_from_fdco: HTTP error for {url}: {e}")
+        return []
+
+    # Strip BOM if present and parse
+    text = resp.content.decode("utf-8-sig")
+    reader = csv_mod.DictReader(io_mod.StringIO(text))
+
+    results: list[dict] = []
+    for row in reader:
+        try:
+            # Goals — both old (HG/AG) and new (FTHG/FTAG) column names
+            home_g_raw = row.get("FTHG") or row.get("HG") or ""
+            away_g_raw = row.get("FTAG") or row.get("AG") or ""
+            if not home_g_raw.strip() or not away_g_raw.strip():
+                continue  # skip rows without result (postponed / future)
+
+            home_g = int(float(home_g_raw))
+            away_g = int(float(away_g_raw))
+
+            # Draw odds — prefer Bet365, fall back through common bookmakers
+            draw_odds = 3.0  # safe default
+            for col in ("B365D", "BWD", "IWD", "WHD", "VCD", "PSC", "MaxD", "AvgD"):
+                val = (row.get(col) or "").strip()
+                if val:
+                    try:
+                        draw_odds = float(val)
+                        break
+                    except ValueError:
+                        continue
+
+            results.append(
+                {
+                    "home_team":   row.get("HomeTeam", ""),
+                    "away_team":   row.get("AwayTeam", ""),
+                    "home_goals":  home_g,
+                    "away_goals":  away_g,
+                    "draw_odds":   draw_odds,
+                    "kickoff_utc": row.get("Date", ""),
+                }
+            )
+        except (ValueError, TypeError, KeyError):
+            continue
+
+    return results
+
+
+def check_api_suspended() -> tuple[bool, str]:
+    """
+    Quick check whether the API-Football account is active.
+    Returns (is_suspended, error_message).
+    Does NOT count towards the daily API quota.
+    """
+    try:
+        key = os.environ.get("API_FOOTBALL_KEY", "")
+        if not key:
+            return True, "API_FOOTBALL_KEY environment variable is not set."
+        resp = requests.get(
+            f"{BASE_URL}/status",
+            headers={"x-apisports-key": key},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        errors = data.get("errors")
+        if errors:
+            msg = list(errors.values())[0] if isinstance(errors, dict) else str(errors)
+            return True, msg
+        return False, ""
+    except Exception as e:
+        return True, str(e)
