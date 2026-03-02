@@ -908,27 +908,30 @@ def page_backtester():
     # TAB 2 — API-Football
     # =========================================================
     with tab_api:
-        # Check API status once per session (doesn't use quota)
-        if "api_status" not in st.session_state:
-            _check_fn = getattr(data_fetcher, "check_api_suspended", None)
-            if _check_fn:
-                is_susp, susp_msg = _check_fn()
-            else:
-                is_susp, susp_msg = True, "API check unavailable — app may need a restart."
-            st.session_state["api_status"] = (is_susp, susp_msg)
-
-        is_suspended, susp_msg = st.session_state["api_status"]
+        # Always check live — no session_state caching so a key update takes effect immediately
+        _check_fn = getattr(data_fetcher, "check_api_suspended", None)
+        if _check_fn:
+            is_suspended, susp_msg = _check_fn()
+        else:
+            is_suspended, susp_msg = True, "check_api_suspended unavailable — restart the app."
 
         if is_suspended:
             st.error(
-                f"**API-Football account issue:** {susp_msg}\n\n"
-                "Visit [dashboard.api-football.com](https://dashboard.api-football.com) "
-                "to check your account. In the meantime, use the **Free Data** tab — "
-                "it works without any API key and includes real Bet365 odds."
+                f"**API-Football returned an error:** `{susp_msg}`\n\n"
+                "**Most common cause:** your API key is stale or invalidated. "
+                "Even if your *account* is active, the key itself can expire after plan "
+                "changes or account reinstatements.\n\n"
+                "**To fix:**\n"
+                "1. Log in to [dashboard.api-football.com](https://dashboard.api-football.com)\n"
+                "2. Go to **My Account → API Key** and copy the current active key\n"
+                "3. On **Streamlit Cloud** → your app → **Settings → Secrets** — "
+                "update `API_FOOTBALL_KEY = \"<new key>\"`\n"
+                "4. On **GitHub** → your repo → **Settings → Secrets → Actions** — "
+                "update the `API_FOOTBALL_KEY` secret\n"
+                "5. Also update the `.env` file locally\n\n"
+                "In the meantime, the **Free Data** tab works without any API key "
+                "and includes real Bet365 historical odds for 19 leagues."
             )
-            if st.button("Re-check API status", key="recheck_api"):
-                del st.session_state["api_status"]
-                st.rerun()
         else:
             st.caption("Fetch a full historical season from API-Football. Uses API quota.")
 
