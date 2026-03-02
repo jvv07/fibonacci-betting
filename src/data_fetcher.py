@@ -1,6 +1,7 @@
 """
-data_fetcher.py — API-Football v3 HTTP client + football-data.co.uk downloader.
-v2: adds FDCO_LEAGUES, fetch_historical_from_fdco, check_api_suspended.
+data_fetcher.py — Multi-source football data client.
+v3: The Odds API (upcoming fixtures + draw odds), OpenLigaDB (German leagues),
+    football-data.co.uk (historical results + Bet365 odds), API-Football (legacy).
 
 Base URL : https://v3.football.api-sports.io
 Auth     : x-apisports-key header (API_FOOTBALL_KEY env var)
@@ -419,3 +420,365 @@ def check_api_suspended() -> tuple[bool, str]:
         return False, ""
     except Exception as e:
         return True, str(e)
+
+
+# ---------------------------------------------------------------------------
+# Cross-source league mappings
+# Centralised here so data_fetcher stays the single source of truth;
+# league_scanner + daily_refresh import these dicts instead of duplicating them.
+# ---------------------------------------------------------------------------
+
+# Odds API sport key → internal league_key (matches the bets/sequences DB tables)
+ODDS_SPORT_KEY_TO_LEAGUE_KEY: dict[str, str] = {
+    "soccer_epl":                    "league_39",
+    "soccer_efl_champ":              "league_40",
+    "soccer_germany_bundesliga":     "league_78",
+    "soccer_germany_bundesliga2":    "league_79",
+    "soccer_italy_serie_a":          "league_135",
+    "soccer_italy_serie_b":          "league_136",
+    "soccer_spain_la_liga":          "league_140",
+    "soccer_spain_segunda_division": "league_141",
+    "soccer_france_ligue_1":         "league_61",
+    "soccer_france_ligue_2":         "league_66",
+    "soccer_netherlands_eredivisie": "league_88",
+    "soccer_belgium_first_div":      "league_144",
+    "soccer_portugal_primeira_liga": "league_94",
+    "soccer_turkey_super_lig":       "league_203",
+    "soccer_greece_super_league":    "league_197",
+    "soccer_scotland_prem":          "league_179",
+}
+
+# Reverse: internal league_key → Odds API sport key
+LEAGUE_KEY_TO_ODDS_SPORT_KEY: dict[str, str] = {
+    v: k for k, v in ODDS_SPORT_KEY_TO_LEAGUE_KEY.items()
+}
+
+# Internal league_key → football-data.co.uk code (for FDCO draw-rate calculation)
+LEAGUE_KEY_TO_FDCO_CODE: dict[str, str] = {
+    "league_39":  "E0",   # Premier League
+    "league_40":  "E1",   # Championship
+    "league_41":  "E2",   # League One
+    "league_42":  "E3",   # League Two
+    "league_78":  "D1",   # Bundesliga
+    "league_79":  "D2",   # 2. Bundesliga
+    "league_135": "I1",   # Serie A
+    "league_136": "I2",   # Serie B
+    "league_140": "SP1",  # La Liga
+    "league_141": "SP2",  # Segunda División
+    "league_61":  "F1",   # Ligue 1
+    "league_66":  "F2",   # Ligue 2
+    "league_88":  "N1",   # Eredivisie
+    "league_144": "B1",   # Belgian Pro League
+    "league_94":  "P1",   # Primeira Liga
+    "league_203": "T1",   # Süper Lig
+    "league_197": "G1",   # Super League Greece
+    "league_179": "SC0",  # Scottish Premiership
+}
+
+# Internal league_key → OpenLigaDB league shortcut (German leagues only)
+LEAGUE_KEY_TO_OPENLIGADB: dict[str, str] = {
+    "league_78": "bl1",   # Bundesliga
+    "league_79": "bl2",   # 2. Bundesliga
+    "league_80": "bl3",   # 3. Liga
+}
+
+
+# ---------------------------------------------------------------------------
+# The Odds API (v4) — upcoming fixtures + real-time draw odds (free tier: 500/month)
+# ---------------------------------------------------------------------------
+
+_ODDS_API_BASE = "https://api.the-odds-api.com/v4"
+_odds_credits_remaining: int | None = None
+_odds_credits_used: int | None = None
+
+
+def _odds_get(path: str, params: dict) -> dict | list | None:
+    """GET from The Odds API. Updates the module-level credit counters from headers."""
+    global _odds_credits_remaining, _odds_credits_used
+    key = os.environ.get("ODDS_API_KEY", "")
+    if not key:
+        print("[data_fetcher] ODDS_API_KEY env var not set.")
+        return None
+    try:
+        resp = requests.get(
+            f"{_ODDS_API_BASE}/{path}",
+            params={"apiKey": key, **params},
+            timeout=20,
+        )
+        try:
+            rem = resp.headers.get("x-requests-remaining")
+            used = resp.headers.get("x-requests-used")
+            if rem is not None:
+                _odds_credits_remaining = int(rem)
+            if used is not None:
+                _odds_credits_used = int(used)
+        except (ValueError, TypeError):
+            pass
+        resp.raise_for_status()
+        return resp.json()
+    except requests.RequestException as e:
+        print(f"[data_fetcher] Odds API /{path} error: {e}")
+        return None
+
+
+def get_odds_api_credits() -> tuple[int | None, int | None]:
+    """Return (remaining, used) credits cached from the last Odds API response."""
+    return _odds_credits_remaining, _odds_credits_used
+
+
+def get_odds_api_status() -> tuple[bool, str, int | None]:
+    """
+    Lightweight status check using the /sports endpoint (costs 0 credits).
+    Returns (is_ok, message, credits_remaining).
+    """
+    key = os.environ.get("ODDS_API_KEY", "")
+    if not key:
+        return False, "ODDS_API_KEY environment variable is not set.", None
+    try:
+        resp = requests.get(
+            f"{_ODDS_API_BASE}/sports",
+            params={"apiKey": key, "all": "false"},
+            timeout=10,
+        )
+        try:
+            global _odds_credits_remaining
+            rem = resp.headers.get("x-requests-remaining")
+            if rem is not None:
+                _odds_credits_remaining = int(rem)
+        except (ValueError, TypeError):
+            pass
+        if resp.status_code == 401:
+            return False, "Invalid API key — check ODDS_API_KEY in secrets.", None
+        if resp.status_code == 422:
+            return False, resp.json().get("message", "API error (422)"), None
+        resp.raise_for_status()
+        return True, "OK", _odds_credits_remaining
+    except Exception as e:
+        return False, str(e), None
+
+
+def fetch_odds_api_fixtures(
+    sport_keys: list[str],
+    days_ahead: int = 3,
+) -> list[dict]:
+    """
+    Fetch upcoming fixtures with Bet365 draw odds from The Odds API.
+    One call per sport_key returns ALL current fixtures + odds for that league.
+
+    Returns a list of dicts matching the same schema as fetch_upcoming_fixtures:
+        fixture_id, league_key, home_team, away_team, kickoff_utc, draw_odds, h2h_draw_rate
+    """
+    import hashlib
+
+    results: list[dict] = []
+    now_utc = datetime.now(timezone.utc)
+    cutoff = now_utc + timedelta(days=days_ahead)
+    cutoff_iso = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    for sport_key in sport_keys:
+        data = _odds_get(
+            f"sports/{sport_key}/odds",
+            {
+                "regions": "uk",
+                "markets": "h2h",
+                "oddsFormat": "decimal",
+                "dateFormat": "iso",
+                "bookmakers": "bet365",
+                "commenceTimeFrom": now_iso,
+                "commenceTimeTo": cutoff_iso,
+            },
+        )
+        if not data or not isinstance(data, list):
+            continue
+
+        league_key = ODDS_SPORT_KEY_TO_LEAGUE_KEY.get(sport_key, f"league_{sport_key}")
+
+        for event in data:
+            try:
+                home = event["home_team"]
+                away = event["away_team"]
+                commence = event["commence_time"]
+
+                # Stable integer fixture_id from home + away + date
+                hash_key = f"{home}:{away}:{commence[:10]}"
+                fixture_id = int(hashlib.md5(hash_key.encode()).hexdigest()[:8], 16)
+
+                # Extract draw price (prefer Bet365, accept any bookmaker)
+                draw_odds: float | None = None
+                for bm in event.get("bookmakers", []):
+                    for market in bm.get("markets", []):
+                        if market.get("key") == "h2h":
+                            for outcome in market.get("outcomes", []):
+                                if outcome.get("name") == "Draw":
+                                    try:
+                                        draw_odds = float(outcome["price"])
+                                    except (ValueError, TypeError):
+                                        pass
+                                    break
+                    if draw_odds is not None:
+                        break
+
+                results.append({
+                    "fixture_id":    fixture_id,
+                    "league_key":    league_key,
+                    "home_team":     home,
+                    "away_team":     away,
+                    "kickoff_utc":   commence,
+                    "draw_odds":     draw_odds,
+                    "h2h_draw_rate": None,
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    return results
+
+
+def fetch_odds_api_scores(
+    overdue_bets: list[dict],
+    sport_key_map: dict[str, str],
+) -> dict:
+    """
+    Fetch completed scores from The Odds API and match against overdue bets.
+
+    Args:
+        overdue_bets: pending bets from the DB (need home_team, away_team, league_key)
+        sport_key_map: dict mapping league_key → odds_api_sport_key
+
+    Returns:
+        dict mapping fixture_id → {fixture_id, result ('WIN'|'LOSS'), home_goals, away_goals}
+    """
+    results: dict = {}
+
+    # Group bets by sport_key
+    by_sport: dict[str, list] = {}
+    for bet in overdue_bets:
+        lk = bet.get("league_key", "")
+        sk = sport_key_map.get(lk)
+        if sk:
+            by_sport.setdefault(sk, []).append(bet)
+        else:
+            print(f"[data_fetcher] No Odds API sport key for league {lk} — skipping result check.")
+
+    for sport_key, bets in by_sport.items():
+        data = _odds_get(
+            f"sports/{sport_key}/scores",
+            {"daysFrom": "3", "dateFormat": "iso"},
+        )
+        if not data or not isinstance(data, list):
+            continue
+
+        # Build lookup: "HomeTeam:AwayTeam" → score info
+        score_lookup: dict[str, dict] = {}
+        for game in data:
+            if not game.get("completed"):
+                continue
+            home = game.get("home_team", "")
+            away = game.get("away_team", "")
+            raw_scores = game.get("scores") or []
+            try:
+                scores_dict = {s["name"]: int(s.get("score") or 0) for s in raw_scores}
+                home_g = scores_dict.get(home, 0)
+                away_g = scores_dict.get(away, 0)
+                score_lookup[f"{home}:{away}"] = {
+                    "home_goals": home_g,
+                    "away_goals": away_g,
+                    "result": "WIN" if home_g == away_g else "LOSS",
+                }
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        for bet in bets:
+            key = f"{bet.get('home_team', '')}:{bet.get('away_team', '')}"
+            if key in score_lookup:
+                entry = {**score_lookup[key], "fixture_id": bet["fixture_id"]}
+                results[bet["fixture_id"]] = entry
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# FDCO-based draw-rate calculation (no API key, more accurate than API calls)
+# ---------------------------------------------------------------------------
+
+def get_league_draw_rate_from_fdco(fdco_code: str, season: int) -> float:
+    """
+    Calculate a league's draw rate from football-data.co.uk historical data.
+    Returns fraction 0.0–1.0. Falls back to 0.0 if the league/season isn't available.
+    """
+    matches = fetch_historical_from_fdco(fdco_code, season)
+    if not matches:
+        return 0.0
+    draws = sum(1 for m in matches if m["home_goals"] == m["away_goals"])
+    return round(draws / len(matches), 4)
+
+
+# ---------------------------------------------------------------------------
+# OpenLigaDB — German leagues, completely free, no API key required
+# ---------------------------------------------------------------------------
+
+_OPENLIGADB_BASE = "https://api.openligadb.de"
+
+# Human-readable labels for the backtester UI
+OPENLIGADB_LEAGUES: dict[str, str] = {
+    "Germany — Bundesliga":   "bl1",
+    "Germany — 2. Bundesliga": "bl2",
+    "Germany — 3. Liga":      "bl3",
+}
+
+
+def fetch_openligadb_historical(league_shortcut: str, season: int) -> list[dict]:
+    """
+    Fetch all finished matches for a German league season from OpenLigaDB.
+    No API key required.
+
+    Args:
+        league_shortcut : 'bl1' (Bundesliga), 'bl2' (2. Bundesliga), 'bl3' (3. Liga)
+        season          : start year, e.g. 2024 for the 2024/25 season
+
+    Returns:
+        List of dicts with keys: home_team, away_team, home_goals, away_goals,
+        draw_odds (always 3.0 — OpenLigaDB has no odds data), kickoff_utc.
+    """
+    url = f"{_OPENLIGADB_BASE}/getmatchdata/{league_shortcut}/{season}"
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.RequestException as e:
+        print(f"[data_fetcher] OpenLigaDB {league_shortcut}/{season} error: {e}")
+        return []
+
+    results: list[dict] = []
+    for match in data:
+        try:
+            if not match.get("matchIsFinished"):
+                continue
+
+            results_list = match.get("matchResults", [])
+            # resultTypeID=2 is the final (90-min) result
+            final = next(
+                (r for r in results_list if r.get("resultTypeID") == 2),
+                results_list[-1] if results_list else None,
+            )
+            if not final:
+                continue
+
+            home_g = int(final.get("pointsTeam1") or 0)
+            away_g = int(final.get("pointsTeam2") or 0)
+            home_name = (match.get("team1") or {}).get("teamName", "")
+            away_name = (match.get("team2") or {}).get("teamName", "")
+            kickoff = match.get("matchDateTime", "")
+
+            results.append({
+                "home_team":   home_name,
+                "away_team":   away_name,
+                "home_goals":  home_g,
+                "away_goals":  away_g,
+                "draw_odds":   3.0,   # OpenLigaDB has no odds — use neutral default
+                "kickoff_utc": kickoff,
+            })
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+
+    return results

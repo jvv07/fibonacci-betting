@@ -6,10 +6,10 @@ workflow_dispatch.  Can also be run locally:
     python scripts/daily_refresh.py
 
 Steps performed:
-  1. Load active league IDs from the database.
-  2. Fetch upcoming fixtures + draw odds → upsert to Supabase.
-  3. Resolve results for any PENDING bets older than 2 hours.
-  4. Re-scan league draw rates if last scan > 7 days ago.
+  1. Determine active leagues + Odds API sport keys.
+  2. Fetch upcoming fixtures + draw odds from The Odds API → upsert to Supabase.
+  3. Resolve results for any PENDING bets older than 2 hours (via Odds API scores).
+  4. Re-scan league draw rates if last scan > 7 days ago (uses FDCO, no API quota).
   5. Build today's qualifying bet list and send the daily alert email.
   6. Print a timestamped summary.
 """
@@ -17,7 +17,6 @@ Steps performed:
 import sys
 from pathlib import Path
 
-# Ensure the project root is importable when called as a script
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from datetime import datetime, timedelta, timezone
@@ -48,46 +47,50 @@ def run() -> dict:
     log("=" * 60)
 
     # ------------------------------------------------------------------
-    # Step 1 — Active league IDs
+    # Step 1 — Active leagues + Odds API sport keys
     # ------------------------------------------------------------------
-    log("Step 1: Loading active league IDs…")
-    active_ids = league_scanner.get_active_league_ids()
+    log("Step 1: Loading active leagues…")
+    sport_key_map = league_scanner.get_active_sport_keys()
 
-    if not active_ids:
-        log("WARNING: No active leagues in DB. Falling back to seed league list.")
-        active_ids = [l["api_id"] for l in league_scanner.SEED_LEAGUES[:6]]
+    if not sport_key_map:
+        log("WARNING: No active leagues with Odds API coverage. Seeding from catalogue…")
+        # Seed from the first 6 SEED_LEAGUES that have odds_api_key
+        for league in league_scanner.SEED_LEAGUES:
+            sk = league.get("odds_api_key")
+            if sk:
+                sport_key_map[league["league_key"]] = sk
+            if len(sport_key_map) >= 6:
+                break
 
-    log(f"  Active league IDs: {active_ids}")
+    sport_keys = list(set(sport_key_map.values()))
+    log(f"  Sport keys: {sport_keys}")
 
     # ------------------------------------------------------------------
-    # Step 2 — Upcoming fixtures + draw odds
+    # Step 2 — Upcoming fixtures + draw odds (The Odds API)
     # ------------------------------------------------------------------
-    log("Step 2: Fetching upcoming fixtures (next 3 days)…")
-    fixtures = data_fetcher.fetch_upcoming_fixtures(active_ids, days_ahead=3)
-    log(f"  Fetched {len(fixtures)} fixtures from API-Football.")
+    log("Step 2: Fetching upcoming fixtures from The Odds API…")
+    fixtures: list[dict] = []
 
-    # Enrich each fixture with draw odds (1 API call each — costs quota)
-    enriched = 0
-    for fix in fixtures:
-        odds = data_fetcher.fetch_draw_odds(fix["fixture_id"])
-        if odds is not None:
-            fix["draw_odds"] = odds
-            enriched += 1
-
-    log(f"  Enriched {enriched}/{len(fixtures)} fixtures with draw odds.")
+    if sport_keys:
+        fixtures = data_fetcher.fetch_odds_api_fixtures(sport_keys, days_ahead=3)
+        log(f"  Fetched {len(fixtures)} fixtures (odds already included).")
+    else:
+        log("  No sport keys — skipping fixture fetch.")
 
     if fixtures:
         ok = db.upsert_fixtures(fixtures)
         log(f"  Upserted fixtures to DB: {'OK' if ok else 'FAILED'}")
 
+    credits_rem, credits_used = data_fetcher.get_odds_api_credits()
+    log(f"  Odds API credits remaining: {credits_rem}  (used this call: 1 per sport key)")
+
     # ------------------------------------------------------------------
-    # Step 3 — Resolve pending bets
+    # Step 3 — Resolve pending bets (Odds API scores endpoint)
     # ------------------------------------------------------------------
     log("Step 3: Checking PENDING bets for results…")
     pending = db.get_pending_bets()
     cutoff = datetime.now(timezone.utc) - timedelta(hours=2)
 
-    # Only bets whose kickoff was at least 2 hours ago (match likely finished)
     overdue = [
         b
         for b in pending
@@ -100,15 +103,12 @@ def run() -> dict:
 
     processed = 0
     if overdue:
-        fixture_ids = [b["fixture_id"] for b in overdue]
-        results_map = {
-            r["fixture_id"]: r for r in data_fetcher.fetch_results(fixture_ids)
-        }
+        results_map = data_fetcher.fetch_odds_api_scores(overdue, sport_key_map)
 
         for bet in overdue:
             fid = bet["fixture_id"]
             if fid not in results_map:
-                log(f"  No result yet for fixture {fid} — will retry tomorrow.")
+                log(f"  No result yet for {bet.get('home_team')} vs {bet.get('away_team')} — will retry tomorrow.")
                 continue
 
             res = results_map[fid]
@@ -119,13 +119,16 @@ def run() -> dict:
                 stake=float(bet.get("stake", 0)),
                 odds=float(bet.get("odds", 2.88)),
             )
-            log(f"  Bet {bet['id']} ({bet.get('home_team')} vs {bet.get('away_team')}): {outcome['message']}")
+            log(
+                f"  Bet {bet['id']} ({bet.get('home_team')} vs {bet.get('away_team')}): "
+                f"{res['result']} ({res['home_goals']}–{res['away_goals']}) — {outcome['message']}"
+            )
             processed += 1
 
     log(f"  Processed {processed} bet result(s).")
 
     # ------------------------------------------------------------------
-    # Step 4 — League draw-rate rescan (if due)
+    # Step 4 — League draw-rate rescan (FDCO — free, no API quota)
     # ------------------------------------------------------------------
     log("Step 4: Checking if league rescan is needed…")
     leagues = league_scanner.update_league_draw_rates()
@@ -170,13 +173,13 @@ def run() -> dict:
                 {
                     "fixture_id": fix["fixture_id"],
                     "league_key": league_key,
-                    "home_team": fix.get("home_team"),
-                    "away_team": fix.get("away_team"),
+                    "home_team":  fix.get("home_team"),
+                    "away_team":  fix.get("away_team"),
                     "kickoff_utc": fix.get("kickoff_utc"),
-                    "fib_step": fib_step,
-                    "stake": stake,
-                    "odds": odds,
-                    "result": "PENDING",
+                    "fib_step":   fib_step,
+                    "stake":      stake,
+                    "odds":       odds,
+                    "result":     "PENDING",
                 }
             )
 
@@ -191,25 +194,25 @@ def run() -> dict:
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
-    api_calls = data_fetcher.get_api_calls_today()
+    credits_rem, credits_used = data_fetcher.get_odds_api_credits()
     stats = db.get_portfolio_stats()
 
     log("=" * 60)
     log("Daily Refresh Complete")
-    log(f"  Fixtures fetched   : {len(fixtures)}")
-    log(f"  Bets processed     : {processed}")
-    log(f"  Qualifying today   : {len(qualifying)}")
-    log(f"  API calls used     : {api_calls}/100")
-    log(f"  Portfolio Net P&L  : £{stats['net_pnl']:.2f}")
-    log(f"  Portfolio ROI      : {stats['roi']:.1f}%")
-    log(f"  Win Rate           : {stats['win_rate']:.1f}%")
+    log(f"  Fixtures fetched          : {len(fixtures)}")
+    log(f"  Bets processed            : {processed}")
+    log(f"  Qualifying today          : {len(qualifying)}")
+    log(f"  Odds API credits remaining: {credits_rem}")
+    log(f"  Portfolio Net P&L         : £{stats['net_pnl']:.2f}")
+    log(f"  Portfolio ROI             : {stats['roi']:.1f}%")
+    log(f"  Win Rate                  : {stats['win_rate']:.1f}%")
     log("=" * 60)
 
     return {
-        "fixtures_fetched": len(fixtures),
-        "bets_processed": processed,
-        "qualifying_today": len(qualifying),
-        "api_calls": api_calls,
+        "fixtures_fetched":   len(fixtures),
+        "bets_processed":     processed,
+        "qualifying_today":   len(qualifying),
+        "credits_remaining":  credits_rem,
     }
 
 

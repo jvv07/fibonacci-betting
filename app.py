@@ -1,13 +1,13 @@
 """
-app.py — Fibonacci Betting dashboard v2.
+app.py — Fibonacci Betting dashboard v3.
 
 Linear-inspired dark UI. Six pages via sidebar navigation:
   Today      — qualifying fixtures, value scores, exposure warning, log results
   Dashboard  — portfolio metrics, P&L chart, monthly heatmap, sequences, risk analytics
   History    — filterable bet log, CSV + Excel download
-  Backtester — API-Football or CSV-driven season simulation
-  Leagues    — draw-rate rankings, activate/deactivate
-  Settings   — staking parameters, ruin probability preview
+  Backtester — FDCO / OpenLigaDB / API-Football / CSV backtesting
+  Leagues    — draw-rate rankings (FDCO-powered), activate/deactivate
+  Settings   — staking parameters, ruin probability preview, API usage
 """
 
 import io
@@ -217,15 +217,25 @@ with st.sidebar:
     )
 
     st.markdown("<hr style='margin:10px 0 8px;'>", unsafe_allow_html=True)
-    _api = data_fetcher.get_api_calls_today()
-    _pct = min(_api / 100, 1.0)
-    _c = "#ef4444" if _pct > 0.9 else "#f59e0b" if _pct > 0.7 else "#00c853"
-    st.markdown(
-        f"<div style='font-size:0.73rem; color:#4b5563; margin-bottom:3px;'>"
-        f"API · <span style='color:{_c};'>{_api}/100</span></div>",
-        unsafe_allow_html=True,
-    )
-    st.progress(_pct)
+    # Odds API credits — check once per session (free /sports call, 0 credits)
+    if "odds_api_credits" not in st.session_state:
+        _ok, _msg, _rem = data_fetcher.get_odds_api_status()
+        st.session_state["odds_api_credits"] = (_ok, _rem)
+    _odds_ok, _odds_rem = st.session_state["odds_api_credits"]
+    if _odds_ok and _odds_rem is not None:
+        _opct = max(0.0, min(_odds_rem / 500, 1.0))
+        _oc = "#ef4444" if _opct < 0.1 else "#f59e0b" if _opct < 0.3 else "#00c853"
+        st.markdown(
+            f"<div style='font-size:0.73rem; color:#4b5563; margin-bottom:3px;'>"
+            f"Odds API · <span style='color:{_oc};'>{_odds_rem}/500 credits</span></div>",
+            unsafe_allow_html=True,
+        )
+        st.progress(_opct)
+    else:
+        st.markdown(
+            "<div style='font-size:0.73rem; color:#ef4444;'>Odds API · no key</div>",
+            unsafe_allow_html=True,
+        )
 
 
 # ===========================================================================
@@ -833,8 +843,8 @@ def page_backtester():
     default_min_odds = float(settings.get("min_odds", 2.88))
     default_max_step = int(settings.get("max_fib_step", 7))
 
-    tab_fdco, tab_api, tab_csv = st.tabs(
-        ["Free Data (19 leagues)", "API-Football", "CSV Upload"]
+    tab_fdco, tab_openliga, tab_api, tab_csv = st.tabs(
+        ["FDCO (19 leagues)", "OpenLigaDB (German)", "API-Football", "CSV Upload"]
     )
 
     # =========================================================
@@ -905,7 +915,82 @@ def page_backtester():
             _render_sim_results(r, lbl)
 
     # =========================================================
-    # TAB 2 — API-Football
+    # TAB 2 — OpenLigaDB (German leagues, no API key)
+    # =========================================================
+    with tab_openliga:
+        st.caption(
+            "Historical Bundesliga / 2. Bundesliga / 3. Liga data from "
+            "[openligadb.de](https://www.openligadb.de) — "
+            "**no API key required**, completely free. "
+            "Note: draw odds are not available from this source (a neutral 3.00 default is used)."
+        )
+
+        _openliga_leagues = getattr(data_fetcher, "OPENLIGADB_LEAGUES", {
+            "Germany — Bundesliga":    "bl1",
+            "Germany — 2. Bundesliga": "bl2",
+            "Germany — 3. Liga":       "bl3",
+        })
+
+        ol1, ol2 = st.columns(2)
+        with ol1:
+            ol_league_name = st.selectbox(
+                "League", list(_openliga_leagues.keys()), key="ol_league"
+            )
+        with ol2:
+            ol_season = st.selectbox(
+                "Season (start year)", [2024, 2023, 2022, 2021, 2020], key="ol_season"
+            )
+
+        olb1, olb2, olb3 = st.columns(3)
+        with olb1:
+            ol_base = st.number_input(
+                "Base Stake (£)", value=default_base, min_value=1.0, step=1.0, key="ol_base"
+            )
+        with olb2:
+            ol_min_odds = st.number_input(
+                "Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0,
+                step=0.01, format="%.2f", key="ol_min",
+            )
+        with olb3:
+            ol_max_step = st.slider(
+                "Max Step", min_value=3, max_value=10, value=default_max_step, key="ol_step"
+            )
+
+        if st.button("Run OpenLigaDB Backtest", type="primary", key="ol_run"):
+            ol_code = _openliga_leagues[ol_league_name]
+            ol_label = f"{ol_league_name} {ol_season}/{str(ol_season + 1)[2:]}"
+
+            _ol_fn = getattr(data_fetcher, "fetch_openligadb_historical", None)
+            if _ol_fn is None:
+                st.error("fetch_openligadb_historical unavailable — restart the app.")
+                st.stop()
+
+            with st.spinner(f"Fetching {ol_label} from OpenLigaDB…"):
+                ol_matches = _ol_fn(ol_code, ol_season)
+
+            if not ol_matches:
+                st.error(
+                    f"No data returned for **{ol_label}**. "
+                    "Try a different season or check your internet connection."
+                )
+                st.stop()
+
+            ol_result = fibonacci_engine.simulate_season(
+                ol_matches, ol_base, ol_min_odds, ol_max_step
+            )
+            ol_result["_matches"] = ol_matches
+            st.session_state["ol_result"] = (ol_result, ol_label)
+
+        if "ol_result" in st.session_state:
+            r, lbl = st.session_state["ol_result"]
+            st.info(
+                "Draw odds from OpenLigaDB are unavailable — a neutral 3.00 was used. "
+                "For real Bet365 odds, use the **FDCO** tab (D1/D2 are available there too)."
+            )
+            _render_sim_results(r, lbl)
+
+    # =========================================================
+    # TAB 3 — API-Football (legacy)
     # =========================================================
     with tab_api:
         # Always check live — no session_state caching so a key update takes effect immediately
@@ -1083,7 +1168,7 @@ def page_leagues():
 
     sc1, sc2 = st.columns([2, 4])
     with sc1:
-        if st.button("Re-Scan Now  (costs API quota)", type="primary"):
+        if st.button("Re-Scan Now  (uses FDCO — free)", type="primary"):
             with st.spinner("Scanning league draw rates…"):
                 leagues = league_scanner.update_league_draw_rates()
             st.success(f"Scan complete — {len(leagues)} leagues updated.")
@@ -1257,25 +1342,43 @@ def page_settings():
     # API usage
     st.markdown("---")
     _section("API Usage", "")
-    api_calls = data_fetcher.get_api_calls_today()
-    pct = min(api_calls / 100, 1.0)
-    _c = "#ef4444" if pct > 0.9 else "#f59e0b" if pct > 0.7 else "#00c853"
+
+    # The Odds API (primary live source)
+    if st.button("Check Odds API Status", key="check_odds_status"):
+        del st.session_state["odds_api_credits"]
+    _odds_ok2, _odds_rem2 = st.session_state.get("odds_api_credits", (None, None))
+    if _odds_ok2 is None:
+        _odds_ok2, _, _odds_rem2 = data_fetcher.get_odds_api_status()
+        st.session_state["odds_api_credits"] = (_odds_ok2, _odds_rem2)
 
     ca, cb = st.columns([3, 1])
     with ca:
-        st.markdown(
-            f"<div style='margin-bottom:4px; font-size:0.9rem;'>"
-            f"Calls today: <strong style='color:{_c};'>{api_calls}/100</strong></div>",
-            unsafe_allow_html=True,
-        )
-        st.progress(pct)
+        if _odds_ok2 and _odds_rem2 is not None:
+            _opct2 = max(0.0, min(_odds_rem2 / 500, 1.0))
+            _oc2 = "#ef4444" if _opct2 < 0.1 else "#f59e0b" if _opct2 < 0.3 else "#00c853"
+            st.markdown(
+                f"<div style='margin-bottom:4px; font-size:0.9rem;'>"
+                f"The Odds API: <strong style='color:{_oc2};'>{_odds_rem2} credits remaining</strong>"
+                f" / 500 per month</div>",
+                unsafe_allow_html=True,
+            )
+            st.progress(_opct2)
+        else:
+            st.error("Odds API key not set or invalid. Add ODDS_API_KEY to Streamlit secrets.")
     with cb:
-        st.metric("Remaining", 100 - api_calls)
+        if _odds_ok2 and _odds_rem2 is not None:
+            st.metric("Credits Left", _odds_rem2)
         _cards()
 
     st.caption(
-        "Free tier: 100 calls/day. App blocks at 95. Counter resets at midnight UTC."
+        "The Odds API free tier: 500 credits/month. One call per league per day = ~16 leagues/day. "
+        "Draw rates + historical data use FDCO (football-data.co.uk) — completely free, no key needed."
     )
+
+    # Legacy API-Football usage counter (kept for reference)
+    with st.expander("API-Football legacy counter"):
+        api_calls = data_fetcher.get_api_calls_today()
+        st.caption(f"Recorded calls today: {api_calls}/100 (account currently suspended)")
 
 
 # ===========================================================================
