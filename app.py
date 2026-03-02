@@ -11,7 +11,9 @@ Linear-inspired dark UI. Six pages via sidebar navigation:
 """
 
 import io
+import math
 import sys
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -25,6 +27,21 @@ sys.path.insert(0, str(Path(__file__).parent))
 load_dotenv()
 
 from src import data_fetcher, db, fibonacci_engine, league_scanner
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def _fetch_fdco_cached(league_code: str, season: int) -> list[dict]:
+    """Cached FDCO download — avoids re-fetching the same CSV within 2 hours."""
+    fn = getattr(data_fetcher, "fetch_historical_from_fdco", None)
+    return fn(league_code, season) if fn else []
+
+
+@st.cache_data(ttl=7200, show_spinner=False)
+def _fetch_ol_cached(shortcut: str, season: int) -> list[dict]:
+    """Cached OpenLigaDB download."""
+    fn = getattr(data_fetcher, "fetch_openligadb_historical", None)
+    return fn(shortcut, season) if fn else []
+
 
 # ---------------------------------------------------------------------------
 # FDCO league map — defined here so the backtester never depends on the
@@ -789,44 +806,292 @@ def page_history():
 # PAGE — BACKTESTER
 # ===========================================================================
 
-def _render_sim_results(r: dict, label: str) -> None:
-    """Shared result display used by all three backtester tabs."""
+def _render_sim_results(r: dict, label: str, min_odds: float = 2.88, max_step: int = 7) -> None:
+    """Shared result display used by all backtester tabs."""
     st.success(f"Simulation complete: **{label}**")
 
+    # ── Core metrics ──────────────────────────────────────────────────────────
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Matches", r["total_bets"])
+    m1.metric("Matches Bet", r["total_bets"])
     m2.metric("Wins (Draws)", r["wins"])
     m3.metric("Draw Rate", f"{r['draw_rate']:.1f}%")
     m4.metric("Net P&L", f"£{r['net_pnl']:+.2f}")
     m5.metric("ROI", f"{r['roi']:+.2f}%")
-
     m6, m7, m8 = st.columns(3)
     m6.metric("Total Staked", f"£{r['total_staked']:.2f}")
     m7.metric("Max Drawdown", f"£{r['max_drawdown']:.2f}")
     m8.metric("Longest Loss Streak", r["longest_loss_streak"])
     _cards()
 
-    if r.get("pnl_series"):
-        fig = px.area(
-            pd.DataFrame({
-                "Bet #": range(1, len(r["pnl_series"]) + 1),
-                "P&L (£)": r["pnl_series"],
-            }),
-            x="Bet #", y="P&L (£)",
-            color_discrete_sequence=["#00c853"],
-        )
-        fig.update_traces(fillcolor="rgba(0,200,83,0.07)", line_color="#00c853", line_width=2)
-        fig.update_layout(
-            plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12", font_color="#9ca3af",
-            xaxis=dict(gridcolor="#1a1e2a"),
-            yaxis=dict(gridcolor="#1a1e2a", zeroline=True, zerolinecolor="#374151"),
-            title=label,
-            title_font=dict(color="#e2e5eb", size=13),
-            margin=dict(l=0, r=0, t=35, b=0),
-        )
-        fig.add_hline(y=0, line_dash="dot", line_color="#374151")
-        st.plotly_chart(fig, use_container_width=True)
+    # Shared Plotly dark style
+    _D   = dict(plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12",
+                font_color="#9ca3af", margin=dict(l=0, r=0, t=38, b=0))
+    _G   = dict(gridcolor="#1a1e2a", zeroline=False)
+    _GZ  = dict(gridcolor="#1a1e2a", zeroline=True, zerolinecolor="#374151")
+    _LEG = dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#9ca3af"), bordercolor="#1a1e2a")
+    _TF  = dict(color="#e2e5eb", size=13)
 
+    pnl_series = r.get("pnl_series", [])
+    bet_log    = r.get("bet_log", [])
+    series_log = r.get("series_log", [])
+
+    # ── Chart 1: Equity curve + bankroll simulation + drawdown shading ────────
+    if pnl_series:
+        _key = "".join(c if c.isalnum() else "_" for c in label)[:40]
+        bankroll_start = st.number_input(
+            "Starting bankroll (£) for simulation overlay",
+            value=1000.0, min_value=100.0, step=100.0, key=f"br_{_key}",
+        )
+        xs = list(range(1, len(pnl_series) + 1))
+        bankroll_curve = [bankroll_start + p for p in pnl_series]
+
+        # Drawdown series
+        peak, max_dd_val, max_dd_idx = 0.0, 0.0, 0
+        for i, p in enumerate(pnl_series):
+            if p > peak:
+                peak = p
+            dd = peak - p
+            if dd > max_dd_val:
+                max_dd_val, max_dd_idx = dd, i
+
+        fig1 = go.Figure()
+        # Green above-zero fill
+        fig1.add_trace(go.Scatter(
+            x=xs, y=pnl_series, mode="lines",
+            line=dict(color="#00c853", width=2),
+            fill="tozeroy", fillcolor="rgba(0,200,83,0.08)",
+            name="Cumulative P&L",
+        ))
+        # Red below-zero fill
+        fig1.add_trace(go.Scatter(
+            x=xs, y=[min(p, 0.0) for p in pnl_series], mode="lines",
+            line=dict(width=0), fill="tozeroy",
+            fillcolor="rgba(239,68,68,0.20)", showlegend=False, hoverinfo="skip",
+        ))
+        # Bankroll line (right axis)
+        fig1.add_trace(go.Scatter(
+            x=xs, y=bankroll_curve, mode="lines",
+            line=dict(color="#f59e0b", width=1.5, dash="dot"),
+            name=f"Bankroll (£{bankroll_start:.0f})", yaxis="y2",
+        ))
+        # Max drawdown marker
+        if max_dd_val > 0:
+            fig1.add_trace(go.Scatter(
+                x=[max_dd_idx + 1], y=[pnl_series[max_dd_idx]],
+                mode="markers+text",
+                marker=dict(color="#ef4444", size=10, symbol="x"),
+                text=[f"  Max DD −£{max_dd_val:.2f}"],
+                textfont=dict(color="#ef4444", size=11),
+                textposition="middle right", name="Max Drawdown",
+            ))
+        fig1.add_hline(y=0, line_dash="dot", line_color="#374151", line_width=1)
+        fig1.update_layout(
+            **_D, title=label, title_font=_TF, hovermode="x unified",
+            xaxis=dict(**_G, title="Bet #"),
+            yaxis=dict(**_GZ, title="Cumulative P&L (£)"),
+            yaxis2=dict(title="Bankroll (£)", overlaying="y", side="right",
+                        showgrid=False, tickfont=dict(color="#f59e0b")),
+            legend=_LEG,
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+
+    # ── Charts 2 & 3 ──────────────────────────────────────────────────────────
+    if series_log or bet_log:
+        c2, c3 = st.columns(2)
+
+        # Chart 2 — Series depth histogram
+        with c2:
+            if series_log:
+                win_cnt  = defaultdict(int)
+                loss_cnt = defaultdict(int)
+                for s in series_log:
+                    (loss_cnt if s["stop_loss"] else win_cnt)[s["depth"]] += 1
+                all_d = sorted(set(win_cnt) | set(loss_cnt))
+                fig2 = go.Figure()
+                fig2.add_trace(go.Bar(x=all_d, y=[win_cnt[d] for d in all_d],
+                                      name="Win (draw)", marker_color="#00c853", opacity=0.85))
+                if any(loss_cnt.values()):
+                    fig2.add_trace(go.Bar(x=all_d, y=[loss_cnt[d] for d in all_d],
+                                          name="Stop-loss", marker_color="#ef4444", opacity=0.85))
+                total_s = len(series_log)
+                pct_1  = round(win_cnt[1] / total_s * 100, 1) if total_s else 0
+                fig2.update_layout(
+                    **_D, barmode="stack", legend=_LEG,
+                    title=f"Series Depth  ({pct_1}% win at step 1)", title_font=_TF,
+                    xaxis=dict(**_G, title="Step Series Ended At", tickmode="linear", dtick=1),
+                    yaxis=dict(**_G, title="# Series"),
+                )
+                st.plotly_chart(fig2, use_container_width=True)
+                st.caption(
+                    f"{total_s} total series · "
+                    f"{sum(win_cnt.values())} wins · "
+                    f"{sum(loss_cnt.values())} stop-losses"
+                )
+
+        # Chart 3 — P&L contribution by Fibonacci step
+        with c3:
+            if bet_log:
+                step_pnl = defaultdict(float)
+                step_cnt = defaultdict(int)
+                for b in bet_log:
+                    step_pnl[b["step"]] += b["pnl"]
+                    step_cnt[b["step"]] += 1
+                steps_     = sorted(step_pnl)
+                pnl_vals   = [round(step_pnl[s], 2) for s in steps_]
+                bar_colors = ["#00c853" if v >= 0 else "#ef4444" for v in pnl_vals]
+                ylabels    = [f"Step {s}  (n={step_cnt[s]})" for s in steps_]
+                fig3 = go.Figure(go.Bar(
+                    x=pnl_vals, y=ylabels, orientation="h",
+                    marker_color=bar_colors, opacity=0.85,
+                    text=[f"£{v:+.2f}" for v in pnl_vals],
+                    textposition="outside", textfont=dict(color="#9ca3af", size=11),
+                ))
+                fig3.add_vline(x=0, line_color="#374151", line_width=1)
+                fig3.update_layout(
+                    **_D, title="Net P&L Contribution by Step", title_font=_TF,
+                    xaxis=dict(**_GZ, title="Net P&L (£)"),
+                    yaxis=dict(gridcolor="#1a1e2a"),
+                    height=max(260, len(steps_) * 54 + 80),
+                )
+                st.plotly_chart(fig3, use_container_width=True)
+                # Insight callout
+                first_neg = next((s for s in steps_ if step_pnl[s] < 0), None)
+                if first_neg:
+                    st.caption(f"Step {first_neg}+ bets are net-negative in aggregate — "
+                               "each recovery win must overcome compounding losses.")
+                else:
+                    st.caption("All steps are net-positive — the win rate comfortably covers losses.")
+
+    # ── Charts 4 & 5 ──────────────────────────────────────────────────────────
+    if bet_log:
+        c4, c5 = st.columns(2)
+
+        # Chart 4 — Odds calibration scatter
+        with c4:
+            bucket_data: dict = defaultdict(list)
+            for b in bet_log:
+                bk = round(math.floor(b["odds"] * 10) / 10, 1)
+                bucket_data[bk].append(1 if b["is_draw"] else 0)
+            bks = sorted(bucket_data)
+            if len(bks) >= 2:
+                imp  = [round(1.0 / bk, 4) for bk in bks]
+                act  = [round(sum(v) / len(v), 4) for v in [bucket_data[bk] for bk in bks]]
+                ns   = [len(bucket_data[bk]) for bk in bks]
+                max_n = max(ns)
+                szs  = [8 + 22 * (n / max_n) for n in ns]
+                xlbls = [f"{bk:.1f}–{bk + 0.09:.2f}" for bk in bks]
+                _maxp = max(max(imp), max(act)) * 1.15
+                fig4 = go.Figure()
+                fig4.add_trace(go.Scatter(
+                    x=[0, _maxp], y=[0, _maxp], mode="lines",
+                    line=dict(color="#374151", dash="dash", width=1),
+                    name="Perfect calibration",
+                ))
+                fig4.add_trace(go.Scatter(
+                    x=imp, y=act, mode="markers",
+                    marker=dict(size=szs, color="#f59e0b", opacity=0.85,
+                                line=dict(color="#1a1e2a", width=1)),
+                    text=[f"Odds {lbl}<br>Implied: {ip:.1%}<br>Actual: {af:.1%}<br>n={n}"
+                          for lbl, ip, af, n in zip(xlbls, imp, act, ns)],
+                    hovertemplate="%{text}<extra></extra>",
+                    name="Observed draw freq",
+                ))
+                fig4.update_layout(
+                    **_D, title="Odds Calibration", title_font=_TF, legend=_LEG,
+                    xaxis=dict(**_G, title="Implied Draw Prob (1/odds)", tickformat=".0%"),
+                    yaxis=dict(**_G, title="Observed Draw Frequency", tickformat=".0%"),
+                )
+                st.plotly_chart(fig4, use_container_width=True)
+                # Check for value
+                above = sum(1 for a, i in zip(act, imp) if a > i)
+                below = len(act) - above
+                st.caption(
+                    f"Dots above the line = bookmaker underpriced the draw risk. "
+                    f"{above} buckets above · {below} below."
+                )
+
+        # Chart 5 — Rolling draw rate
+        with c5:
+            WINDOW = min(20, max(5, len(bet_log) // 8))
+            is_draws = [1 if b["is_draw"] else 0 for b in bet_log]
+            bet_nums = [b["bet_num"] for b in bet_log]
+            rolling  = [
+                sum(is_draws[max(0, i - WINDOW + 1): i + 1]) /
+                len(is_draws[max(0, i - WINDOW + 1): i + 1])
+                for i in range(len(is_draws))
+            ]
+            overall  = sum(is_draws) / len(is_draws) if is_draws else 0
+            fig5 = go.Figure()
+            fig5.add_trace(go.Scatter(
+                x=bet_nums, y=rolling, mode="lines",
+                line=dict(color="#00c853", width=2),
+                fill="tozeroy", fillcolor="rgba(0,200,83,0.07)",
+                name=f"{WINDOW}-bet rolling draw rate",
+            ))
+            fig5.add_hline(
+                y=overall, line_dash="dot", line_color="#f59e0b", line_width=1.5,
+                annotation_text=f"Season avg {overall:.1%}",
+                annotation_font_color="#f59e0b", annotation_position="bottom right",
+            )
+            fig5.update_layout(
+                **_D, title=f"Rolling Draw Rate ({WINDOW}-match window)", title_font=_TF,
+                xaxis=dict(**_G, title="Bet #"),
+                yaxis=dict(**_G, title="Draw Rate", tickformat=".0%",
+                           range=[0, min(1.0, overall * 3 + 0.05)]),
+                legend=_LEG,
+            )
+            st.plotly_chart(fig5, use_container_width=True)
+            # Streak variance insight
+            if is_draws:
+                chunks = []
+                cur = 0
+                for d in is_draws:
+                    if d == 0:
+                        cur += 1
+                    else:
+                        if cur:
+                            chunks.append(cur)
+                        cur = 0
+                if chunks:
+                    avg_streak = sum(chunks) / len(chunks)
+                    st.caption(
+                        f"Average losing run: {avg_streak:.1f} bets · "
+                        f"Longest: {max(chunks)} · Series that reached step 4+: "
+                        f"{sum(1 for c in chunks if c >= 3)}"
+                    )
+
+    # ── Chart 6 — Break-even odds per step (mathematical) ────────────────────
+    FIBS   = fibonacci_engine.FIBONACCI
+    steps6 = list(range(1, max_step + 1))
+    be_odds = [round(sum(FIBS[:n]) / FIBS[n - 1], 4) for n in steps6]
+    be_colors6 = ["#00c853" if min_odds >= be else "#ef4444" for be in be_odds]
+    fig6 = go.Figure(go.Bar(
+        x=[f"Step {s}" for s in steps6], y=be_odds,
+        marker_color=be_colors6, opacity=0.85,
+        text=[f"{be:.2f}" for be in be_odds],
+        textposition="outside", textfont=dict(color="#9ca3af", size=11),
+        name="Break-even odds",
+    ))
+    fig6.add_hline(
+        y=min_odds, line_dash="dash", line_color="#f59e0b", line_width=2,
+        annotation_text=f"Your min odds: {min_odds:.2f}",
+        annotation_font_color="#f59e0b", annotation_position="top left",
+    )
+    fig6.update_layout(
+        **_D,
+        title="Break-even Odds by Step  (green = your filter covers recovery cost)",
+        title_font=_TF,
+        xaxis=dict(**_G, title="Fibonacci Step"),
+        yaxis=dict(**_G, title="Min Odds to Recover Full Series Cost", rangemode="tozero"),
+        legend=_LEG,
+    )
+    st.plotly_chart(fig6, use_container_width=True)
+    st.caption(
+        "The Fibonacci property: recovery odds converge to φ² ≈ 2.618. "
+        f"At min odds {min_odds:.2f}, every step is {'fully covered ✓' if min_odds >= max(be_odds) else f'covered up to step {next((i+1 for i,b in enumerate(be_odds) if b > min_odds), max_step)}'}."
+    )
+
+    # ── Match breakdown expander ──────────────────────────────────────────────
     if r.get("_matches"):
         with st.expander("Match breakdown"):
             df_m = pd.DataFrame(r["_matches"])
@@ -843,8 +1108,8 @@ def page_backtester():
     default_min_odds = float(settings.get("min_odds", 2.88))
     default_max_step = int(settings.get("max_fib_step", 7))
 
-    tab_fdco, tab_openliga, tab_api, tab_csv = st.tabs(
-        ["FDCO (19 leagues)", "OpenLigaDB (German)", "API-Football", "CSV Upload"]
+    tab_fdco, tab_openliga, tab_api, tab_csv, tab_analysis = st.tabs(
+        ["FDCO (19 leagues)", "OpenLigaDB (German)", "API-Football", "CSV Upload", "Analysis"]
     )
 
     # =========================================================
@@ -904,11 +1169,11 @@ def page_backtester():
                         matches, fdco_base, fdco_min_odds, fdco_max_step
                     )
                     result["_matches"] = matches
-                    st.session_state["fdco_result"] = (result, f"{fdco_league} {season_label}")
+                    st.session_state["fdco_result"] = (result, f"{fdco_league} {season_label}", fdco_min_odds, fdco_max_step)
 
         if "fdco_result" in st.session_state:
-            r, lbl = st.session_state["fdco_result"]
-            _render_sim_results(r, lbl)
+            r, lbl, _mo, _ms = st.session_state["fdco_result"]
+            _render_sim_results(r, lbl, _mo, _ms)
 
     # =========================================================
     # TAB 2 — OpenLigaDB (German leagues, no API key)
@@ -971,15 +1236,15 @@ def page_backtester():
                         ol_matches, ol_base, ol_min_odds, ol_max_step
                     )
                     ol_result["_matches"] = ol_matches
-                    st.session_state["ol_result"] = (ol_result, ol_label)
+                    st.session_state["ol_result"] = (ol_result, ol_label, ol_min_odds, ol_max_step)
 
         if "ol_result" in st.session_state:
-            r, lbl = st.session_state["ol_result"]
+            r, lbl, _mo, _ms = st.session_state["ol_result"]
             st.info(
                 "Draw odds from OpenLigaDB are unavailable — a neutral 3.00 was used. "
                 "For real Bet365 odds, use the **FDCO** tab (D1/D2 are available there too)."
             )
-            _render_sim_results(r, lbl)
+            _render_sim_results(r, lbl, _mo, _ms)
 
     # =========================================================
     # TAB 3 — API-Football (legacy)
@@ -1089,11 +1354,11 @@ def page_backtester():
                             matches, bt_base, bt_min_odds, bt_max_step
                         )
                         result["_matches"] = matches
-                        st.session_state["api_bt_result"] = (result, f"{league_opts[sel_key]} — {api_season}")
+                        st.session_state["api_bt_result"] = (result, f"{league_opts[sel_key]} — {api_season}", bt_min_odds, bt_max_step)
 
             if "api_bt_result" in st.session_state:
-                r, lbl = st.session_state["api_bt_result"]
-                _render_sim_results(r, lbl)
+                r, lbl, _mo, _ms = st.session_state["api_bt_result"]
+                _render_sim_results(r, lbl, _mo, _ms)
 
     # =========================================================
     # TAB 3 — CSV Upload
@@ -1133,13 +1398,512 @@ def page_backtester():
                     matches = df_csv[["home_goals", "away_goals", "draw_odds"]].to_dict("records")
                     res = fibonacci_engine.simulate_season(matches, csv_base, csv_min, csv_step)
                     res["_matches"] = df_csv.to_dict("records")
-                    st.session_state["csv_result"] = (res, f"CSV — {uploaded.name}")
+                    st.session_state["csv_result"] = (res, f"CSV — {uploaded.name}", csv_min, csv_step)
             except Exception as e:
                 st.error(f"Error: {e}")
 
         if "csv_result" in st.session_state:
-            r, lbl = st.session_state["csv_result"]
-            _render_sim_results(r, lbl)
+            r, lbl, _mo, _ms = st.session_state["csv_result"]
+            _render_sim_results(r, lbl, _mo, _ms)
+
+    # =========================================================
+    # TAB 5 — Data Analysis
+    # =========================================================
+    with tab_analysis:
+        st.caption(
+            "Cross-league and cross-season analytics powered by "
+            "[football-data.co.uk](https://www.football-data.co.uk) historical data. "
+            "All simulations run client-side — no API quota used."
+        )
+
+        analysis_mode = st.radio(
+            "Analysis mode",
+            ["Multi-League Comparison", "Season Trend", "Parameter Sensitivity"],
+            horizontal=True,
+            key="analysis_mode",
+        )
+
+        # Shared dark theme helpers (local to this tab)
+        _AD   = dict(plot_bgcolor="#0d0f12", paper_bgcolor="#0d0f12",
+                     font_color="#9ca3af", margin=dict(l=0, r=0, t=40, b=0))
+        _AG   = dict(gridcolor="#1a1e2a", zeroline=False)
+        _ALEG = dict(bgcolor="rgba(0,0,0,0)", font=dict(color="#9ca3af"), bordercolor="#1a1e2a")
+        _ATF  = dict(color="#e2e5eb", size=13)
+
+        # ── Mode 1: Multi-League Comparison ───────────────────────────────────
+        if analysis_mode == "Multi-League Comparison":
+            st.markdown(
+                "**Compare up to 19 FDCO leagues in a single season — "
+                "see which leagues suit the Fibonacci system best.**"
+            )
+
+            mc1, mc2 = st.columns([3, 1])
+            with mc1:
+                ml_leagues = st.multiselect(
+                    "Leagues to compare",
+                    options=list(_FDCO_LEAGUES.keys()),
+                    default=list(_FDCO_LEAGUES.keys())[:6],
+                    key="ml_leagues",
+                )
+            with mc2:
+                ml_season = st.selectbox(
+                    "Season", [2024, 2023, 2022, 2021, 2020], key="ml_season"
+                )
+
+            mp1, mp2, mp3 = st.columns(3)
+            with mp1:
+                ml_base = st.number_input(
+                    "Base Stake (£)", value=default_base, min_value=1.0, step=1.0, key="ml_base"
+                )
+            with mp2:
+                ml_min_odds = st.number_input(
+                    "Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0,
+                    step=0.01, format="%.2f", key="ml_min",
+                )
+            with mp3:
+                ml_max_step = st.slider(
+                    "Max Step", min_value=3, max_value=10, value=default_max_step, key="ml_step"
+                )
+
+            if st.button("Run Comparison", type="primary", key="ml_run"):
+                if not ml_leagues:
+                    st.warning("Select at least one league.")
+                else:
+                    _fdco_fn = getattr(data_fetcher, "fetch_historical_from_fdco", None)
+                    if _fdco_fn is None:
+                        st.error("fetch_historical_from_fdco unavailable — restart the app.")
+                    else:
+                        ml_rows = []
+                        prog = st.progress(0.0)
+                        for i, league_name in enumerate(ml_leagues):
+                            code = _FDCO_LEAGUES[league_name]
+                            matches = _fdco_fn(code, ml_season)
+                            if matches:
+                                res = fibonacci_engine.simulate_season(
+                                    matches, ml_base, ml_min_odds, ml_max_step
+                                )
+                                ml_rows.append({
+                                    "league": league_name.split(" — ", 1)[-1],
+                                    "full_name": league_name,
+                                    "roi": res["roi"],
+                                    "draw_rate": res["draw_rate"],
+                                    "net_pnl": res["net_pnl"],
+                                    "max_drawdown": res["max_drawdown"],
+                                    "total_bets": res["total_bets"],
+                                    "wins": res["wins"],
+                                    "losses": res["losses"],
+                                    "longest_streak": res["longest_loss_streak"],
+                                })
+                            prog.progress((i + 1) / len(ml_leagues))
+                        prog.empty()
+                        season_str = f"{ml_season}/{str(ml_season + 1)[2:]}"
+                        st.session_state["ml_results"] = (ml_rows, season_str)
+
+            if "ml_results" in st.session_state:
+                ml_rows, season_str = st.session_state["ml_results"]
+                if not ml_rows:
+                    st.warning("No data returned for any selected league.")
+                else:
+                    df_ml = pd.DataFrame(ml_rows).sort_values("roi", ascending=False)
+                    st.markdown(f"#### {season_str} — {len(df_ml)} leagues")
+                    st.dataframe(
+                        df_ml[["league", "total_bets", "draw_rate", "roi", "net_pnl",
+                               "max_drawdown", "longest_streak"]].rename(columns={
+                            "league": "League", "total_bets": "Bets",
+                            "draw_rate": "Draw %", "roi": "ROI %",
+                            "net_pnl": "Net P&L (£)", "max_drawdown": "Max DD (£)",
+                            "longest_streak": "Longest Loss",
+                        }).reset_index(drop=True),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                    r1, r2 = st.columns(2)
+
+                    with r1:
+                        fig_roi = go.Figure(go.Bar(
+                            x=df_ml["league"],
+                            y=df_ml["roi"],
+                            marker_color=["#00c853" if v >= 0 else "#ef4444" for v in df_ml["roi"]],
+                            text=[f"{v:+.1f}%" for v in df_ml["roi"]],
+                            textposition="outside",
+                            textfont=dict(color="#9ca3af", size=10),
+                            opacity=0.85,
+                        ))
+                        fig_roi.add_hline(y=0, line_dash="dot", line_color="#374151")
+                        fig_roi.update_layout(
+                            **_AD, title=f"ROI % by League  ({season_str})", title_font=_ATF,
+                            xaxis=dict(**_AG, tickangle=-40),
+                            yaxis=dict(**_AG, title="ROI %"),
+                        )
+                        st.plotly_chart(fig_roi, use_container_width=True)
+
+                    with r2:
+                        max_dd_abs = max(abs(v) for v in df_ml["max_drawdown"]) + 1e-6
+                        fig_scatter = go.Figure(go.Scatter(
+                            x=df_ml["draw_rate"],
+                            y=df_ml["roi"],
+                            mode="markers+text",
+                            marker=dict(
+                                size=[8 + 20 * (abs(v) / max_dd_abs) for v in df_ml["max_drawdown"]],
+                                color=["#00c853" if v >= 0 else "#ef4444" for v in df_ml["roi"]],
+                                opacity=0.85,
+                                line=dict(color="#1a1e2a", width=1),
+                            ),
+                            text=df_ml["league"],
+                            textposition="top center",
+                            textfont=dict(color="#9ca3af", size=9),
+                            hovertemplate=(
+                                "<b>%{text}</b><br>"
+                                "Draw Rate: %{x:.1f}%<br>"
+                                "ROI: %{y:+.1f}%<extra></extra>"
+                            ),
+                        ))
+                        fig_scatter.add_vline(
+                            x=df_ml["draw_rate"].mean(), line_dash="dot",
+                            line_color="#374151", line_width=1,
+                        )
+                        fig_scatter.add_hline(y=0, line_dash="dot", line_color="#374151", line_width=1)
+                        fig_scatter.update_layout(
+                            **_AD,
+                            title="Draw Rate vs ROI  (bubble size = max drawdown)",
+                            title_font=_ATF,
+                            xaxis=dict(**_AG, title="Draw Rate (%)"),
+                            yaxis=dict(**_AG, title="ROI %"),
+                        )
+                        st.plotly_chart(fig_scatter, use_container_width=True)
+
+                    df_sorted_pnl = df_ml.sort_values("net_pnl", ascending=True)
+                    fig_pnl = go.Figure(go.Bar(
+                        x=df_sorted_pnl["net_pnl"],
+                        y=df_sorted_pnl["league"],
+                        orientation="h",
+                        marker_color=["#00c853" if v >= 0 else "#ef4444"
+                                      for v in df_sorted_pnl["net_pnl"]],
+                        text=[f"£{v:+.2f}" for v in df_sorted_pnl["net_pnl"]],
+                        textposition="outside",
+                        textfont=dict(color="#9ca3af", size=10),
+                        opacity=0.85,
+                    ))
+                    fig_pnl.add_vline(x=0, line_color="#374151")
+                    fig_pnl.update_layout(
+                        **_AD,
+                        title=f"Net P&L by League  ({season_str})", title_font=_ATF,
+                        xaxis=dict(**_AG, title="Net P&L (£)"),
+                        yaxis=dict(gridcolor="#1a1e2a"),
+                        height=max(300, len(df_sorted_pnl) * 38 + 80),
+                    )
+                    st.plotly_chart(fig_pnl, use_container_width=True)
+
+        # ── Mode 2: Season Trend ──────────────────────────────────────────────
+        elif analysis_mode == "Season Trend":
+            st.markdown(
+                "**Track how the Fibonacci system's performance evolves across "
+                "multiple seasons for a single league.**"
+            )
+
+            st1c, st2c = st.columns([2, 2])
+            with st1c:
+                trend_league = st.selectbox(
+                    "League", list(_FDCO_LEAGUES.keys()), key="trend_league"
+                )
+            with st2c:
+                trend_seasons = st.multiselect(
+                    "Seasons (start years)",
+                    [2024, 2023, 2022, 2021, 2020, 2019, 2018],
+                    default=[2020, 2021, 2022, 2023, 2024],
+                    key="trend_seasons",
+                )
+
+            tp1, tp2, tp3 = st.columns(3)
+            with tp1:
+                trend_base = st.number_input(
+                    "Base Stake (£)", value=default_base, min_value=1.0, step=1.0, key="trend_base"
+                )
+            with tp2:
+                trend_min_odds = st.number_input(
+                    "Min Odds", value=default_min_odds, min_value=1.5, max_value=5.0,
+                    step=0.01, format="%.2f", key="trend_min",
+                )
+            with tp3:
+                trend_max_step = st.slider(
+                    "Max Step", min_value=3, max_value=10, value=default_max_step, key="trend_step"
+                )
+
+            if st.button("Run Season Trend", type="primary", key="trend_run"):
+                if not trend_seasons:
+                    st.warning("Select at least one season.")
+                else:
+                    _fdco_fn = getattr(data_fetcher, "fetch_historical_from_fdco", None)
+                    if _fdco_fn is None:
+                        st.error("fetch_historical_from_fdco unavailable — restart the app.")
+                    else:
+                        trend_rows = []
+                        code = _FDCO_LEAGUES[trend_league]
+                        prog2 = st.progress(0.0)
+                        for i, yr in enumerate(sorted(trend_seasons)):
+                            matches = _fdco_fn(code, yr)
+                            if matches:
+                                res = fibonacci_engine.simulate_season(
+                                    matches, trend_base, trend_min_odds, trend_max_step
+                                )
+                                trend_rows.append({
+                                    "season": f"{yr}/{str(yr + 1)[2:]}",
+                                    "year": yr,
+                                    "roi": res["roi"],
+                                    "draw_rate": res["draw_rate"],
+                                    "net_pnl": res["net_pnl"],
+                                    "max_drawdown": res["max_drawdown"],
+                                    "total_bets": res["total_bets"],
+                                    "longest_streak": res["longest_loss_streak"],
+                                })
+                            prog2.progress((i + 1) / len(trend_seasons))
+                        prog2.empty()
+                        st.session_state["trend_results"] = (trend_rows, trend_league)
+
+            if "trend_results" in st.session_state:
+                trend_rows, _tl = st.session_state["trend_results"]
+                if not trend_rows:
+                    st.warning("No data found for the selected seasons.")
+                else:
+                    df_tr = pd.DataFrame(trend_rows).sort_values("year")
+                    st.markdown(f"#### {_tl} — season-by-season")
+                    st.dataframe(
+                        df_tr.drop("year", axis=1).rename(columns={
+                            "season": "Season", "roi": "ROI %", "draw_rate": "Draw %",
+                            "net_pnl": "Net P&L (£)", "max_drawdown": "Max DD (£)",
+                            "total_bets": "Bets", "longest_streak": "Longest Loss",
+                        }).reset_index(drop=True),
+                        use_container_width=True, hide_index=True,
+                    )
+
+                    ta1, ta2 = st.columns(2)
+                    with ta1:
+                        fig_tr_roi = go.Figure(go.Scatter(
+                            x=df_tr["season"], y=df_tr["roi"],
+                            mode="lines+markers",
+                            line=dict(color="#00c853", width=2.5),
+                            marker=dict(size=8, color="#00c853"),
+                            fill="tozeroy", fillcolor="rgba(0,200,83,0.07)",
+                            name="ROI %",
+                        ))
+                        fig_tr_roi.add_hline(y=0, line_dash="dot", line_color="#374151")
+                        fig_tr_roi.update_layout(
+                            **_AD, title="ROI % by Season", title_font=_ATF,
+                            xaxis=dict(**_AG, title="Season"),
+                            yaxis=dict(**_AG, title="ROI %"),
+                        )
+                        st.plotly_chart(fig_tr_roi, use_container_width=True)
+
+                    with ta2:
+                        fig_tr_dr = go.Figure(go.Scatter(
+                            x=df_tr["season"], y=df_tr["draw_rate"],
+                            mode="lines+markers",
+                            line=dict(color="#f59e0b", width=2.5),
+                            marker=dict(size=8, color="#f59e0b"),
+                            name="Draw Rate %",
+                        ))
+                        avg_dr = df_tr["draw_rate"].mean()
+                        fig_tr_dr.add_hline(
+                            y=avg_dr, line_dash="dot", line_color="#4b5563",
+                            annotation_text=f"Avg {avg_dr:.1f}%",
+                            annotation_font_color="#4b5563",
+                        )
+                        fig_tr_dr.update_layout(
+                            **_AD, title="Draw Rate % by Season", title_font=_ATF,
+                            xaxis=dict(**_AG, title="Season"),
+                            yaxis=dict(**_AG, title="Draw Rate %"),
+                        )
+                        st.plotly_chart(fig_tr_dr, use_container_width=True)
+
+                    fig_tr_pnl = go.Figure()
+                    fig_tr_pnl.add_trace(go.Bar(
+                        x=df_tr["season"], y=df_tr["net_pnl"],
+                        name="Net P&L",
+                        marker_color=["#00c853" if v >= 0 else "#ef4444"
+                                      for v in df_tr["net_pnl"]],
+                        opacity=0.85,
+                        text=[f"£{v:+.0f}" for v in df_tr["net_pnl"]],
+                        textposition="outside",
+                    ))
+                    fig_tr_pnl.add_trace(go.Scatter(
+                        x=df_tr["season"],
+                        y=[-v for v in df_tr["max_drawdown"]],
+                        mode="lines+markers",
+                        line=dict(color="#ef4444", dash="dot", width=2),
+                        marker=dict(size=7),
+                        name="−Max Drawdown",
+                    ))
+                    fig_tr_pnl.update_layout(
+                        **_AD, barmode="group",
+                        title="Net P&L and Max Drawdown by Season", title_font=_ATF,
+                        xaxis=dict(**_AG, title="Season"),
+                        yaxis=dict(**_AG, title="£"),
+                        legend=_ALEG,
+                    )
+                    st.plotly_chart(fig_tr_pnl, use_container_width=True)
+
+        # ── Mode 3: Parameter Sensitivity ────────────────────────────────────
+        elif analysis_mode == "Parameter Sensitivity":
+            st.markdown(
+                "**Grid-search `min_odds` × `max_step` combinations and visualise "
+                "which settings maximise your chosen metric.**"
+            )
+
+            ps1, ps2 = st.columns(2)
+            with ps1:
+                sens_league = st.selectbox(
+                    "League", list(_FDCO_LEAGUES.keys()), key="sens_league"
+                )
+            with ps2:
+                sens_season = st.selectbox(
+                    "Season", [2024, 2023, 2022, 2021, 2020], key="sens_season"
+                )
+
+            sp1, sp2 = st.columns(2)
+            with sp1:
+                sens_base = st.number_input(
+                    "Base Stake (£)", value=default_base, min_value=1.0, step=1.0, key="sens_base"
+                )
+            with sp2:
+                sens_metric = st.selectbox(
+                    "Optimise for",
+                    ["ROI %", "Net P&L (£)", "Max Drawdown (£)", "Draw Rate %"],
+                    key="sens_metric",
+                )
+
+            odds_range = st.select_slider(
+                "Min Odds range",
+                options=[round(x * 0.1, 1) for x in range(18, 41)],
+                value=(2.0, 3.5),
+                key="sens_odds_range",
+            )
+            step_range = st.select_slider(
+                "Max Step range",
+                options=list(range(3, 11)),
+                value=(4, 8),
+                key="sens_step_range",
+            )
+
+            if st.button("Run Sensitivity Analysis", type="primary", key="sens_run"):
+                _fdco_fn = getattr(data_fetcher, "fetch_historical_from_fdco", None)
+                if _fdco_fn is None:
+                    st.error("fetch_historical_from_fdco unavailable — restart the app.")
+                else:
+                    sens_code = _FDCO_LEAGUES[sens_league]
+                    with st.spinner(f"Downloading {sens_league} {sens_season}…"):
+                        sens_matches = _fdco_fn(sens_code, sens_season)
+                    if not sens_matches:
+                        st.error("No data returned for this league/season.")
+                    else:
+                        odds_vals = [
+                            round(x * 0.1, 1)
+                            for x in range(
+                                int(odds_range[0] * 10),
+                                int(odds_range[1] * 10) + 1,
+                                2,  # step by 0.2 to keep grid size manageable
+                            )
+                        ]
+                        step_vals = list(range(step_range[0], step_range[1] + 1))
+                        total_runs = len(odds_vals) * len(step_vals)
+                        prog3 = st.progress(0.0)
+                        metric_key = {
+                            "ROI %": "roi",
+                            "Net P&L (£)": "net_pnl",
+                            "Max Drawdown (£)": "max_drawdown",
+                            "Draw Rate %": "draw_rate",
+                        }[sens_metric]
+
+                        grid: list[list[float]] = []
+                        run_count = 0
+                        for step_val in step_vals:
+                            row = []
+                            for odds_val in odds_vals:
+                                res = fibonacci_engine.simulate_season(
+                                    sens_matches, sens_base, odds_val, step_val
+                                )
+                                val = res[metric_key]
+                                # Flip drawdown so higher cell = better (less drawdown)
+                                if metric_key == "max_drawdown":
+                                    val = -val
+                                row.append(round(val, 2))
+                                run_count += 1
+                                prog3.progress(run_count / total_runs)
+                            grid.append(row)
+                        prog3.empty()
+
+                        st.session_state["sens_result"] = {
+                            "grid": grid,
+                            "odds_vals": odds_vals,
+                            "step_vals": step_vals,
+                            "metric": sens_metric,
+                            "metric_key": metric_key,
+                            "label": f"{sens_league} {sens_season}/{str(sens_season + 1)[2:]}",
+                        }
+
+            if "sens_result" in st.session_state:
+                sr = st.session_state["sens_result"]
+                grid      = sr["grid"]
+                odds_vals = sr["odds_vals"]
+                step_vals = sr["step_vals"]
+                metric_lbl = sr["metric"]
+                metric_key = sr["metric_key"]
+                slbl      = sr["label"]
+
+                x_labels      = [f"{o:.1f}" for o in odds_vals]
+                y_labels      = [f"Step {s}" for s in step_vals]
+                # Reverse rows so lowest step sits at the bottom of the heatmap
+                grid_disp    = list(reversed(grid))
+                y_labels_disp = list(reversed(y_labels))
+
+                fig_heat = go.Figure(go.Heatmap(
+                    z=grid_disp,
+                    x=x_labels,
+                    y=y_labels_disp,
+                    colorscale="RdYlGn",
+                    text=[
+                        [f"{v:+.1f}" if metric_key != "max_drawdown" else f"−£{abs(v):.0f}"
+                         for v in row]
+                        for row in grid_disp
+                    ],
+                    texttemplate="%{text}",
+                    textfont=dict(size=10, color="white"),
+                    hovertemplate=(
+                        "Min Odds: %{x}<br>Step: %{y}<br>"
+                        + metric_lbl + ": %{z}<extra></extra>"
+                    ),
+                    colorbar=dict(title=metric_lbl, tickfont=dict(color="#9ca3af")),
+                ))
+                fig_heat.update_layout(
+                    **_AD,
+                    title=f"{metric_lbl} — Parameter Sensitivity  ({slbl})", title_font=_ATF,
+                    xaxis=dict(title="Min Odds Filter", **_AG),
+                    yaxis=dict(title="Max Fibonacci Step", **_AG),
+                    height=max(350, len(step_vals) * 55 + 120),
+                )
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+                # Best cell callout
+                flat = [
+                    (grid[si][oi], step_vals[si], odds_vals[oi])
+                    for si in range(len(step_vals))
+                    for oi in range(len(odds_vals))
+                ]
+                best_val, best_step, best_odds = max(flat, key=lambda x: x[0])
+                if metric_key == "max_drawdown":
+                    st.success(
+                        f"Lowest drawdown: **−£{abs(best_val):.2f}** at "
+                        f"min odds **{best_odds:.1f}** / max step **{best_step}**"
+                    )
+                else:
+                    unit = "%" if "%" in metric_lbl else "£"
+                    st.success(
+                        f"Best **{metric_lbl}**: **{best_val:+.2f}{unit}** at "
+                        f"min odds **{best_odds:.1f}** / max step **{best_step}**"
+                    )
+                st.caption(
+                    f"Grid: {len(odds_vals)} odds values × {len(step_vals)} step values = "
+                    f"{len(odds_vals) * len(step_vals)} simulations run."
+                )
 
 
 # ===========================================================================

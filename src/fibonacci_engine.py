@@ -178,7 +178,8 @@ def simulate_season(
 
     Returns:
         dict with keys: total_bets, wins, losses, draw_rate, total_staked,
-                        net_pnl, roi, max_drawdown, longest_loss_streak, pnl_series
+                        net_pnl, roi, max_drawdown, longest_loss_streak,
+                        pnl_series, bet_log, series_log
     """
     step = 1
     total_staked = 0.0
@@ -189,6 +190,14 @@ def simulate_season(
     max_drawdown = 0.0
     current_streak = longest_streak = 0
 
+    # Per-bet and per-series analytics tracking
+    bet_log: list[dict] = []
+    series_log: list[dict] = []
+    bet_num = 0
+    series_num = 0
+    series_staked: float = 0.0   # stakes accumulated in current open series
+    series_pnl: float = 0.0      # running pnl in current open series
+
     for match in matches:
         odds = float(match.get("draw_odds") or 0.0)
         home_g = int(match.get("home_goals") or 0)
@@ -198,7 +207,18 @@ def simulate_season(
             continue
 
         if step > max_step:
-            # Stop-loss — reset and skip this match
+            # Stop-loss triggered on previous loss — record the completed series
+            series_num += 1
+            series_log.append({
+                "series_num":   series_num,
+                "depth":        max_step,
+                "total_staked": round(series_staked, 2),
+                "pnl":          round(series_pnl, 2),
+                "win_odds":     0.0,
+                "stop_loss":    True,
+            })
+            series_staked = 0.0
+            series_pnl = 0.0
             step = 1
             continue
 
@@ -206,6 +226,8 @@ def simulate_season(
         stake = round(base_stake * FIBONACCI[idx], 2)
         total_staked += stake
         bets_placed += 1
+        bet_num += 1
+        current_step = step   # capture before mutation
 
         is_draw = home_g == away_g
 
@@ -213,12 +235,47 @@ def simulate_season(
             pnl = round(stake * odds - stake, 2)
             net_pnl += pnl
             wins += 1
+
+            bet_log.append({
+                "bet_num": bet_num,
+                "step":    current_step,
+                "stake":   stake,
+                "odds":    odds,
+                "is_draw": True,
+                "pnl":     pnl,
+                "cum_pnl": round(net_pnl, 2),
+            })
+
+            series_num += 1
+            series_log.append({
+                "series_num":   series_num,
+                "depth":        current_step,
+                "total_staked": round(series_staked + stake, 2),
+                "pnl":          round(series_pnl + pnl, 2),
+                "win_odds":     odds,
+                "stop_loss":    False,
+            })
+            series_staked = 0.0
+            series_pnl = 0.0
             step = 1
             current_streak = 0
         else:
             pnl = -stake
             net_pnl += pnl
             losses += 1
+
+            bet_log.append({
+                "bet_num": bet_num,
+                "step":    current_step,
+                "stake":   stake,
+                "odds":    odds,
+                "is_draw": False,
+                "pnl":     pnl,
+                "cum_pnl": round(net_pnl, 2),
+            })
+
+            series_staked += stake
+            series_pnl += pnl
             step += 1
             current_streak += 1
             if current_streak > longest_streak:
@@ -226,14 +283,13 @@ def simulate_season(
 
         pnl_series.append(round(net_pnl, 2))
 
-        # Track drawdown
         if net_pnl > peak_pnl:
             peak_pnl = net_pnl
         drawdown = peak_pnl - net_pnl
         if drawdown > max_drawdown:
             max_drawdown = drawdown
 
-    # Compute draw rate only across matches with qualifying odds
+    # Compute draw rate across matches with qualifying odds
     eligible = [m for m in matches if float(m.get("draw_odds") or 0) >= min_odds]
     qualified_draws = sum(
         1
@@ -244,14 +300,16 @@ def simulate_season(
     roi = (net_pnl / total_staked * 100) if total_staked else 0.0
 
     return {
-        "total_bets": bets_placed,
-        "wins": wins,
-        "losses": losses,
-        "draw_rate": round(draw_rate, 1),
-        "total_staked": round(total_staked, 2),
-        "net_pnl": round(net_pnl, 2),
-        "roi": round(roi, 2),
-        "max_drawdown": round(max_drawdown, 2),
+        "total_bets":          bets_placed,
+        "wins":                wins,
+        "losses":              losses,
+        "draw_rate":           round(draw_rate, 1),
+        "total_staked":        round(total_staked, 2),
+        "net_pnl":             round(net_pnl, 2),
+        "roi":                 round(roi, 2),
+        "max_drawdown":        round(max_drawdown, 2),
         "longest_loss_streak": longest_streak,
-        "pnl_series": pnl_series,
+        "pnl_series":          pnl_series,
+        "bet_log":             bet_log,
+        "series_log":          series_log,
     }
