@@ -27,6 +27,32 @@ load_dotenv()
 from src import data_fetcher, db, fibonacci_engine, league_scanner
 
 # ---------------------------------------------------------------------------
+# FDCO league map — defined here so the backtester never depends on the
+# data_fetcher module attribute (avoids stale-.pyc AttributeErrors on Cloud).
+# ---------------------------------------------------------------------------
+_FDCO_LEAGUES: dict[str, str] = {
+    "England — Premier League":   "E0",
+    "England — Championship":     "E1",
+    "England — League One":       "E2",
+    "England — League Two":       "E3",
+    "Germany — Bundesliga":       "D1",
+    "Germany — 2. Bundesliga":    "D2",
+    "Italy — Serie A":            "I1",
+    "Italy — Serie B":            "I2",
+    "Spain — La Liga":            "SP1",
+    "Spain — Segunda División":   "SP2",
+    "France — Ligue 1":           "F1",
+    "France — Ligue 2":           "F2",
+    "Netherlands — Eredivisie":   "N1",
+    "Belgium — First Division A": "B1",
+    "Portugal — Primeira Liga":   "P1",
+    "Turkey — Süper Lig":         "T1",
+    "Greece — Super League":      "G1",
+    "Scotland — Premiership":     "SC0",
+    "Scotland — Championship":    "SC1",
+}
+
+# ---------------------------------------------------------------------------
 # Graceful streamlit-extras import
 # ---------------------------------------------------------------------------
 try:
@@ -821,7 +847,7 @@ def page_backtester():
             "**no API key required**, completely free."
         )
 
-        fdco_names = list(data_fetcher.FDCO_LEAGUES.keys())
+        fdco_names = list(_FDCO_LEAGUES.keys())
 
         fc1, fc2 = st.columns(2)
         with fc1:
@@ -847,11 +873,19 @@ def page_backtester():
             )
 
         if st.button("Run Backtest", type="primary", key="fdco_run"):
-            league_code = data_fetcher.FDCO_LEAGUES[fdco_league]
+            league_code = _FDCO_LEAGUES[fdco_league]
             season_label = f"{fdco_season}/{str(fdco_season + 1)[2:]}"
 
+            _fdco_fn = getattr(data_fetcher, "fetch_historical_from_fdco", None)
+            if _fdco_fn is None:
+                st.error(
+                    "fetch_historical_from_fdco not available — the app may need a restart. "
+                    "On Streamlit Cloud, click **Manage app → Reboot app** in the bottom-right."
+                )
+                st.stop()
+
             with st.spinner(f"Downloading {fdco_league} {season_label}…"):
-                matches = data_fetcher.fetch_historical_from_fdco(league_code, fdco_season)
+                matches = _fdco_fn(league_code, fdco_season)
 
             if not matches:
                 st.error(
@@ -876,7 +910,11 @@ def page_backtester():
     with tab_api:
         # Check API status once per session (doesn't use quota)
         if "api_status" not in st.session_state:
-            is_susp, susp_msg = data_fetcher.check_api_suspended()
+            _check_fn = getattr(data_fetcher, "check_api_suspended", None)
+            if _check_fn:
+                is_susp, susp_msg = _check_fn()
+            else:
+                is_susp, susp_msg = True, "API check unavailable — app may need a restart."
             st.session_state["api_status"] = (is_susp, susp_msg)
 
         is_suspended, susp_msg = st.session_state["api_status"]

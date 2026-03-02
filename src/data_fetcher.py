@@ -1,5 +1,6 @@
 """
-data_fetcher.py — API-Football v3 HTTP client with daily rate-limit tracking.
+data_fetcher.py — API-Football v3 HTTP client + football-data.co.uk downloader.
+v2: adds FDCO_LEAGUES, fetch_historical_from_fdco, check_api_suspended.
 
 Base URL : https://v3.football.api-sports.io
 Auth     : x-apisports-key header (API_FOOTBALL_KEY env var)
