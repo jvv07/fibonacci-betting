@@ -333,8 +333,8 @@ def page_today():
 
     styled = (
         df.style
-        .applymap(_colour_odds, subset=["Odds"])
-        .applymap(_colour_value, subset=["Value Score"])
+        .map(_colour_odds, subset=["Odds"])
+        .map(_colour_value, subset=["Value Score"])
         .format({
             "Odds": "{:.2f}",
             "Stake (£)": "£{:.2f}",
@@ -885,30 +885,26 @@ def page_backtester():
         if st.button("Run Backtest", type="primary", key="fdco_run"):
             league_code = _FDCO_LEAGUES[fdco_league]
             season_label = f"{fdco_season}/{str(fdco_season + 1)[2:]}"
-
             _fdco_fn = getattr(data_fetcher, "fetch_historical_from_fdco", None)
             if _fdco_fn is None:
                 st.error(
                     "fetch_historical_from_fdco not available — the app may need a restart. "
                     "On Streamlit Cloud, click **Manage app → Reboot app** in the bottom-right."
                 )
-                st.stop()
-
-            with st.spinner(f"Downloading {fdco_league} {season_label}…"):
-                matches = _fdco_fn(league_code, fdco_season)
-
-            if not matches:
-                st.error(
-                    f"No data for **{fdco_league} {season_label}**. "
-                    "The season may not be available yet, or try a different season."
-                )
-                st.stop()
-
-            result = fibonacci_engine.simulate_season(
-                matches, fdco_base, fdco_min_odds, fdco_max_step
-            )
-            result["_matches"] = matches
-            st.session_state["fdco_result"] = (result, f"{fdco_league} {season_label}")
+            else:
+                with st.spinner(f"Downloading {fdco_league} {season_label}…"):
+                    matches = _fdco_fn(league_code, fdco_season)
+                if not matches:
+                    st.error(
+                        f"No data for **{fdco_league} {season_label}**. "
+                        "The season may not be available yet, or try a different season."
+                    )
+                else:
+                    result = fibonacci_engine.simulate_season(
+                        matches, fdco_base, fdco_min_odds, fdco_max_step
+                    )
+                    result["_matches"] = matches
+                    st.session_state["fdco_result"] = (result, f"{fdco_league} {season_label}")
 
         if "fdco_result" in st.session_state:
             r, lbl = st.session_state["fdco_result"]
@@ -959,27 +955,23 @@ def page_backtester():
         if st.button("Run OpenLigaDB Backtest", type="primary", key="ol_run"):
             ol_code = _openliga_leagues[ol_league_name]
             ol_label = f"{ol_league_name} {ol_season}/{str(ol_season + 1)[2:]}"
-
             _ol_fn = getattr(data_fetcher, "fetch_openligadb_historical", None)
             if _ol_fn is None:
                 st.error("fetch_openligadb_historical unavailable — restart the app.")
-                st.stop()
-
-            with st.spinner(f"Fetching {ol_label} from OpenLigaDB…"):
-                ol_matches = _ol_fn(ol_code, ol_season)
-
-            if not ol_matches:
-                st.error(
-                    f"No data returned for **{ol_label}**. "
-                    "Try a different season or check your internet connection."
-                )
-                st.stop()
-
-            ol_result = fibonacci_engine.simulate_season(
-                ol_matches, ol_base, ol_min_odds, ol_max_step
-            )
-            ol_result["_matches"] = ol_matches
-            st.session_state["ol_result"] = (ol_result, ol_label)
+            else:
+                with st.spinner(f"Fetching {ol_label} from OpenLigaDB…"):
+                    ol_matches = _ol_fn(ol_code, ol_season)
+                if not ol_matches:
+                    st.error(
+                        f"No data returned for **{ol_label}**. "
+                        "Try a different season or check your internet connection."
+                    )
+                else:
+                    ol_result = fibonacci_engine.simulate_season(
+                        ol_matches, ol_base, ol_min_odds, ol_max_step
+                    )
+                    ol_result["_matches"] = ol_matches
+                    st.session_state["ol_result"] = (ol_result, ol_label)
 
         if "ol_result" in st.session_state:
             r, lbl = st.session_state["ol_result"]
@@ -993,12 +985,14 @@ def page_backtester():
     # TAB 3 — API-Football (legacy)
     # =========================================================
     with tab_api:
-        # Always check live — no session_state caching so a key update takes effect immediately
-        _check_fn = getattr(data_fetcher, "check_api_suspended", None)
-        if _check_fn:
-            is_suspended, susp_msg = _check_fn()
-        else:
-            is_suspended, susp_msg = True, "check_api_suspended unavailable — restart the app."
+        # Cache the status check — avoids a live HTTP call on every page render
+        if "apifb_status" not in st.session_state:
+            _check_fn = getattr(data_fetcher, "check_api_suspended", None)
+            if _check_fn:
+                st.session_state["apifb_status"] = _check_fn()
+            else:
+                st.session_state["apifb_status"] = (True, "check_api_suspended unavailable — restart the app.")
+        is_suspended, susp_msg = st.session_state["apifb_status"]
 
         if is_suspended:
             st.error(
@@ -1071,34 +1065,31 @@ def page_backtester():
                 )
                 if not api_id:
                     st.error("Could not determine API ID for this league.")
-                    st.stop()
-
-                with st.spinner("Fetching data from API-Football…"):
-                    raw = data_fetcher.fetch_historical_fixtures(api_id, api_season)
-
-                if not raw:
-                    st.error(
-                        "No data returned. Check your account at "
-                        "[dashboard.api-football.com](https://dashboard.api-football.com) "
-                        "or use the Free Data tab."
-                    )
-                    st.stop()
-
-                matches = [
-                    {
-                        "home_goals": f["home_goals"],
-                        "away_goals": f["away_goals"],
-                        "draw_odds": bt_default_odds,
-                        "home_team": f["home_team"],
-                        "away_team": f["away_team"],
-                    }
-                    for f in raw
-                ]
-                result = fibonacci_engine.simulate_season(
-                    matches, bt_base, bt_min_odds, bt_max_step
-                )
-                result["_matches"] = matches
-                st.session_state["api_bt_result"] = (result, f"{league_opts[sel_key]} — {api_season}")
+                else:
+                    with st.spinner("Fetching data from API-Football…"):
+                        raw = data_fetcher.fetch_historical_fixtures(api_id, api_season)
+                    if not raw:
+                        st.error(
+                            "No data returned. Check your account at "
+                            "[dashboard.api-football.com](https://dashboard.api-football.com) "
+                            "or use the FDCO tab instead."
+                        )
+                    else:
+                        matches = [
+                            {
+                                "home_goals": f["home_goals"],
+                                "away_goals": f["away_goals"],
+                                "draw_odds": bt_default_odds,
+                                "home_team": f["home_team"],
+                                "away_team": f["away_team"],
+                            }
+                            for f in raw
+                        ]
+                        result = fibonacci_engine.simulate_season(
+                            matches, bt_base, bt_min_odds, bt_max_step
+                        )
+                        result["_matches"] = matches
+                        st.session_state["api_bt_result"] = (result, f"{league_opts[sel_key]} — {api_season}")
 
             if "api_bt_result" in st.session_state:
                 r, lbl = st.session_state["api_bt_result"]
@@ -1138,13 +1129,11 @@ def page_backtester():
                 missing_cols = {"home_goals", "away_goals", "draw_odds"} - set(df_csv.columns)
                 if missing_cols:
                     st.error(f"Missing required columns: {missing_cols}")
-                    st.stop()
-
-                matches = df_csv[["home_goals", "away_goals", "draw_odds"]].to_dict("records")
-                res = fibonacci_engine.simulate_season(matches, csv_base, csv_min, csv_step)
-                res["_matches"] = df_csv.to_dict("records")
-                st.session_state["csv_result"] = (res, f"CSV — {uploaded.name}")
-
+                else:
+                    matches = df_csv[["home_goals", "away_goals", "draw_odds"]].to_dict("records")
+                    res = fibonacci_engine.simulate_season(matches, csv_base, csv_min, csv_step)
+                    res["_matches"] = df_csv.to_dict("records")
+                    st.session_state["csv_result"] = (res, f"CSV — {uploaded.name}")
             except Exception as e:
                 st.error(f"Error: {e}")
 
